@@ -353,6 +353,29 @@ func (f *Fosite) authorizeRequestFromPAR(ctx context.Context, r *http.Request, r
 	return true, nil
 }
 
+func (f *Fosite) prepareAuthorizeRequestForErrorRedirect(ctx context.Context, r *http.Request, request *AuthorizeRequest) {
+	if request.GetClient() == nil || request.GetRedirectURI() != nil {
+		return
+	}
+
+	if err := f.ParseResponseMode(ctx, r, request); err != nil {
+		request.ResponseMode = ResponseModeDefault
+	}
+
+	if err := f.validateAuthorizeRedirectURI(r, request); err != nil {
+		return
+	}
+
+	if request.GetResponseMode() == ResponseModeDefault {
+		responseTypes := RemoveEmpty(strings.Split(request.Form.Get("response_type"), " "))
+		if Arguments(responseTypes).ExactOne("code") {
+			request.SetDefaultResponseMode(ResponseModeQuery)
+		} else {
+			request.SetDefaultResponseMode(ResponseModeFragment)
+		}
+	}
+}
+
 func (f *Fosite) NewAuthorizeRequest(ctx context.Context, r *http.Request) (_ AuthorizeRequester, err error) {
 	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer("github.com/ory/fosite").Start(ctx, "Fosite.NewAuthorizeRequest")
 	defer otelx.End(span, &err)
@@ -399,6 +422,7 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 	// All other parse methods should come afterwards so that we ensure that the data is taken
 	// from the request_object if set.
 	if err := f.authorizeRequestParametersFromOpenIDConnectRequest(ctx, request, isPARRequest); err != nil {
+		f.prepareAuthorizeRequestForErrorRedirect(ctx, r, request)
 		return request, err
 	}
 
