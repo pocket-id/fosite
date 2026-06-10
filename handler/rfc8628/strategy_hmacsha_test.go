@@ -87,11 +87,11 @@ func TestHMACDeviceCode(t *testing.T) {
 			token, signature, err := hmacshaStrategy.GenerateDeviceCode(context.TODO())
 			assert.NoError(t, err)
 			assert.Equal(t, strings.Split(token, ".")[1], signature)
-			assert.Contains(t, token, "ory_dc_")
+			assert.Contains(t, token, "pocket_id_dc_")
 
 			for k, token := range []string{
 				token,
-				strings.TrimPrefix(token, "ory_dc_"),
+				strings.TrimPrefix(token, "pocket_id_dc_"),
 			} {
 				t.Run(fmt.Sprintf("prefix=%v", k == 0), func(t *testing.T) {
 					err = hmacshaStrategy.ValidateDeviceCode(context.TODO(), c.r, token)

@@ -69,13 +69,13 @@ func TestHMACAccessToken(t *testing.T) {
 			r:      hmacValidCase,
 			pass:   true,
 			strat:  hmacshaStrategy,
-			prefix: "ory_at_",
+			prefix: "pocket_id_at_",
 		},
 		{
 			r:      hmacExpiredCase,
 			pass:   false,
 			strat:  hmacshaStrategy,
-			prefix: "ory_at_",
+			prefix: "pocket_id_at_",
 		},
 		{
 			r:     hmacValidCase,
@@ -130,11 +130,11 @@ func TestHMACRefreshToken(t *testing.T) {
 			token, signature, err := hmacshaStrategy.GenerateRefreshToken(context.Background(), &c.r)
 			assert.NoError(t, err)
 			assert.Equal(t, strings.Split(token, ".")[1], signature)
-			assert.Contains(t, token, "ory_rt_")
+			assert.Contains(t, token, "pocket_id_rt_")
 
 			for k, token := range []string{
 				token,
-				strings.TrimPrefix(token, "ory_rt_"),
+				strings.TrimPrefix(token, "pocket_id_rt_"),
 			} {
 				t.Run(fmt.Sprintf("prefix=%v", k == 0), func(t *testing.T) {
 					err = hmacshaStrategy.ValidateRefreshToken(context.Background(), &c.r, token)
@@ -169,11 +169,11 @@ func TestHMACAuthorizeCode(t *testing.T) {
 			token, signature, err := hmacshaStrategy.GenerateAuthorizeCode(context.Background(), &c.r)
 			assert.NoError(t, err)
 			assert.Equal(t, strings.Split(token, ".")[1], signature)
-			assert.Contains(t, token, "ory_ac_")
+			assert.Contains(t, token, "pocket_id_ac_")
 
 			for k, token := range []string{
 				token,
-				strings.TrimPrefix(token, "ory_ac_"),
+				strings.TrimPrefix(token, "pocket_id_ac_"),
 			} {
 				t.Run(fmt.Sprintf("prefix=%v", k == 0), func(t *testing.T) {
 					err = hmacshaStrategy.ValidateAuthorizeCode(context.Background(), &c.r, token)

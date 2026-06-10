@@ -29,7 +29,7 @@ func NewHMACSHAStrategy(
 }
 
 func (h *HMACSHAStrategy) getPrefix(part string) string {
-	return fmt.Sprintf("ory_%s_", part)
+	return fmt.Sprintf("pocket_id_%s_", part)
 }
 
 func (h *HMACSHAStrategy) trimPrefix(token, part string) string {
