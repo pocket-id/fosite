@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 
@@ -206,6 +207,74 @@ func TestNewAuthorizeRequest(t *testing.T) {
 					RequestedAudience: []string{"https://cloud.ory.sh/api", "https://www.ory.sh/api"},
 				},
 			},
+		},
+		/* invalid OIDC prompt parameter */
+		{
+			desc: "should fail because prompt none cannot be combined with login",
+			conf: &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}},
+			query: url.Values{
+				"redirect_uri":  {"https://foo.bar/cb"},
+				"client_id":     {"1234"},
+				"response_type": {"code"},
+				"state":         {"strong-state"},
+				"scope":         {"openid"},
+				"prompt":        {"none login"},
+			},
+			mock: func() {
+				store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{RedirectURIs: []string{"https://foo.bar/cb"}, Scopes: []string{"openid"}, ResponseTypes: []string{"code"}}, nil)
+			},
+			expectedError: ErrInvalidRequest,
+		},
+		/* invalid OIDC prompt parameter */
+		{
+			desc: "should fail because prompt none cannot be combined with consent",
+			conf: &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}},
+			query: url.Values{
+				"redirect_uri":  {"https://foo.bar/cb"},
+				"client_id":     {"1234"},
+				"response_type": {"code"},
+				"state":         {"strong-state"},
+				"scope":         {"openid"},
+				"prompt":        {"none consent"},
+			},
+			mock: func() {
+				store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{RedirectURIs: []string{"https://foo.bar/cb"}, Scopes: []string{"openid"}, ResponseTypes: []string{"code"}}, nil)
+			},
+			expectedError: ErrInvalidRequest,
+		},
+		/* invalid OIDC prompt parameter */
+		{
+			desc: "should fail because prompt none cannot be combined with select_account",
+			conf: &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}},
+			query: url.Values{
+				"redirect_uri":  {"https://foo.bar/cb"},
+				"client_id":     {"1234"},
+				"response_type": {"code"},
+				"state":         {"strong-state"},
+				"scope":         {"openid"},
+				"prompt":        {"none select_account"},
+			},
+			mock: func() {
+				store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{RedirectURIs: []string{"https://foo.bar/cb"}, Scopes: []string{"openid"}, ResponseTypes: []string{"code"}}, nil)
+			},
+			expectedError: ErrInvalidRequest,
+		},
+		/* invalid OIDC prompt parameter */
+		{
+			desc: "should fail because prompt value is unknown",
+			conf: &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}},
+			query: url.Values{
+				"redirect_uri":  {"https://foo.bar/cb"},
+				"client_id":     {"1234"},
+				"response_type": {"code"},
+				"state":         {"strong-state"},
+				"scope":         {"openid"},
+				"prompt":        {"unknown"},
+			},
+			mock: func() {
+				store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{RedirectURIs: []string{"https://foo.bar/cb"}, Scopes: []string{"openid"}, ResponseTypes: []string{"code"}}, nil)
+			},
+			expectedError: ErrInvalidRequest,
 		},
 		/* repeated audience parameter */
 		{
@@ -559,4 +628,37 @@ func TestNewAuthorizeRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewAuthorizeRequestInvalidPromptCanRedirectAuthorizeError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	store := NewMockStorage(ctrl)
+	defer ctrl.Finish()
+
+	conf := &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}}
+	query := url.Values{
+		"redirect_uri":  {"https://foo.bar/cb"},
+		"client_id":     {"1234"},
+		"response_type": {"code"},
+		"state":         {"strong-state"},
+		"scope":         {"openid"},
+		"prompt":        {"none consent"},
+	}
+	req := &http.Request{Header: http.Header{}, URL: &url.URL{RawQuery: query.Encode()}}
+
+	store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{RedirectURIs: []string{"https://foo.bar/cb"}, Scopes: []string{"openid"}, ResponseTypes: []string{"code"}}, nil)
+
+	ar, err := conf.NewAuthorizeRequest(context.Background(), req)
+	require.EqualError(t, err, ErrInvalidRequest.Error())
+	require.True(t, ar.IsRedirectURIValid())
+
+	rw := httptest.NewRecorder()
+	conf.WriteAuthorizeError(context.Background(), rw, ar, err)
+
+	require.Equal(t, http.StatusSeeOther, rw.Code)
+	location, err := url.Parse(rw.Header().Get("Location"))
+	require.NoError(t, err)
+	assert.Equal(t, "https://foo.bar/cb", location.Scheme+"://"+location.Host+location.Path)
+	assert.Equal(t, "invalid_request", location.Query().Get("error"))
+	assert.Equal(t, "strong-state", location.Query().Get("state"))
 }

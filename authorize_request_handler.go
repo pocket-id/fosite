@@ -193,6 +193,36 @@ func (f *Fosite) parseAuthorizeScope(_ *http.Request, request *AuthorizeRequest)
 	return nil
 }
 
+var defaultAuthorizePromptValues = []string{"login", "none", "consent", "select_account"}
+
+func (f *Fosite) validateAuthorizePrompt(ctx context.Context, request *AuthorizeRequest) error {
+	if !request.GetRequestedScopes().Has("openid") {
+		return nil
+	}
+
+	requiredPrompt := RemoveEmpty(strings.Split(request.GetRequestForm().Get("prompt"), " "))
+	if len(requiredPrompt) == 0 {
+		return nil
+	}
+
+	availablePrompts := f.Config.GetAllowedPrompts(ctx)
+	if len(availablePrompts) == 0 {
+		availablePrompts = defaultAuthorizePromptValues
+	}
+
+	for _, prompt := range requiredPrompt {
+		if !stringslice.Has(availablePrompts, prompt) {
+			return errorsx.WithStack(ErrInvalidRequest.WithHintf("Used unknown value '%s' for prompt parameter", requiredPrompt))
+		}
+	}
+
+	if stringslice.Has(requiredPrompt, "none") && len(requiredPrompt) > 1 {
+		return errorsx.WithStack(ErrInvalidRequest.WithHint("Parameter 'prompt' was set to 'none', but contains other values as well which is not allowed."))
+	}
+
+	return nil
+}
+
 func (f *Fosite) validateAuthorizeScope(ctx context.Context, _ *http.Request, request *AuthorizeRequest) error {
 	for _, permission := range request.GetRequestedScopes() {
 		if !f.Config.GetScopeStrategy(ctx)(request.Client.GetScopes(), permission) {
@@ -415,6 +445,10 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 			// If the response type is not `code` it is an implicit/hybrid (fragment) response mode.
 			request.SetDefaultResponseMode(ResponseModeFragment)
 		}
+	}
+
+	if err = f.validateAuthorizePrompt(ctx, request); err != nil {
+		return request, err
 	}
 
 	// rfc6819 4.4.1.8.  Threat: CSRF Attack against redirect-uri
