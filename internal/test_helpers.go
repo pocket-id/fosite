@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	cristaljwt "github.com/cristalhq/jwt/v4"
+	cristaljwt "github.com/cristalhq/jwt/v5"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/html"
 	goauth "golang.org/x/oauth2"

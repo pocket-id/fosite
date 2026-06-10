@@ -6,7 +6,6 @@ package storage
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 
 	"github.com/ory/fosite"
@@ -14,8 +13,7 @@ import (
 
 func TestMemoryStore_Authenticate(t *testing.T) {
 	type fields struct {
-		Users      map[string]MemoryUserRelation
-		usersMutex sync.RWMutex
+		Users map[string]MemoryUserRelation
 	}
 	type args struct {
 		in0    context.Context
@@ -49,8 +47,7 @@ func TestMemoryStore_Authenticate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &MemoryStore{
-				Users:      tt.fields.Users,
-				usersMutex: tt.fields.usersMutex,
+				Users: tt.fields.Users,
 			}
 			if _, err := s.Authenticate(tt.args.in0, tt.args.name, tt.args.secret); err == nil || !errors.Is(err, tt.wantErr) {
 				t.Errorf("Authenticate() error = %v, wantErr %v", err, tt.wantErr)

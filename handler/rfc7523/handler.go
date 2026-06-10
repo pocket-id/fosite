@@ -10,8 +10,8 @@ import (
 
 	"github.com/ory/fosite/handler/oauth2"
 
-	"github.com/go-jose/go-jose/v3"
-	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 
 	"github.com/ory/fosite"
 	"github.com/ory/x/errorsx"
@@ -19,6 +19,17 @@ import (
 
 // #nosec:gosec G101 - False Positive
 const grantTypeJWTBearer = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+
+// assertionSignatureAlgorithms is the list of signature algorithms accepted for the
+// JWT bearer assertion. Unlike fosite's own JWT parser this excludes "none", because
+// assertions must be signed.
+var assertionSignatureAlgorithms = []jose.SignatureAlgorithm{
+	jose.RS256, jose.RS384, jose.RS512,
+	jose.ES256, jose.ES384, jose.ES512,
+	jose.PS256, jose.PS384, jose.PS512,
+	jose.HS256, jose.HS384, jose.HS512,
+	jose.EdDSA,
+}
 
 type Handler struct {
 	Storage RFC7523KeyStorage
@@ -51,7 +62,7 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 		return errorsx.WithStack(fosite.ErrInvalidRequest.WithHintf("The assertion request parameter must be set when using grant_type of '%s'.", grantTypeJWTBearer))
 	}
 
-	token, err := jwt.ParseSigned(assertion)
+	token, err := jwt.ParseSigned(assertion, assertionSignatureAlgorithms)
 	if err != nil {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.
 			WithHint("Unable to parse JSON Web Token passed in \"assertion\" request parameter.").
