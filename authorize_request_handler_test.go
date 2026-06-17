@@ -663,6 +663,67 @@ func TestNewAuthorizeRequestInvalidPromptCanRedirectAuthorizeError(t *testing.T)
 	assert.Equal(t, "strong-state", location.Query().Get("state"))
 }
 
+func TestNewAuthorizeRequestUsesRedirectURIMatcher(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	store := NewMockStorage(ctrl)
+	defer ctrl.Finish()
+
+	conf := &Fosite{
+		Store: store,
+		Config: &Config{
+			ScopeStrategy:            ExactScopeStrategy,
+			AudienceMatchingStrategy: DefaultAudienceMatchingStrategy,
+			RedirectURIMatcher: func(rawurl string, client Client) (*url.URL, error) {
+				if rawurl == "https://tenant.example.com/callback" && len(client.GetRedirectURIs()) == 1 && client.GetRedirectURIs()[0] == "https://*.example.com/callback" {
+					return url.Parse(rawurl)
+				}
+				return nil, ErrInvalidRequest
+			},
+		},
+	}
+	query := url.Values{
+		"redirect_uri":  {"https://tenant.example.com/callback"},
+		"client_id":     {"1234"},
+		"response_type": {"code"},
+		"state":         {"strong-state"},
+	}
+	req := &http.Request{Header: http.Header{}, URL: &url.URL{RawQuery: query.Encode()}}
+
+	store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{
+		RedirectURIs:  []string{"https://*.example.com/callback"},
+		ResponseTypes: []string{"code"},
+	}, nil)
+
+	ar, err := conf.NewAuthorizeRequest(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, "https://tenant.example.com/callback", ar.GetRedirectURI().String())
+	require.True(t, ar.IsRedirectURIValid())
+}
+
+func TestNewAuthorizeRequestRejectsWildcardLikeRedirectByDefault(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	store := NewMockStorage(ctrl)
+	defer ctrl.Finish()
+
+	conf := &Fosite{Store: store, Config: &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy}}
+	query := url.Values{
+		"redirect_uri":  {"https://tenant.example.com/callback"},
+		"client_id":     {"1234"},
+		"response_type": {"code"},
+		"state":         {"strong-state"},
+	}
+	req := &http.Request{Header: http.Header{}, URL: &url.URL{RawQuery: query.Encode()}}
+
+	store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{
+		RedirectURIs:  []string{"https://*.example.com/callback"},
+		ResponseTypes: []string{"code"},
+	}, nil)
+
+	ar, err := conf.NewAuthorizeRequest(context.Background(), req)
+	require.EqualError(t, err, ErrInvalidRequest.Error())
+	require.False(t, ar.IsRedirectURIValid())
+}
+
 func TestNewAuthorizeRequestUnsupportedRequestObjectCanRedirectAuthorizeError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	store := NewMockStorage(ctrl)

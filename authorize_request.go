@@ -18,12 +18,13 @@ const (
 
 // AuthorizeRequest is an implementation of AuthorizeRequester
 type AuthorizeRequest struct {
-	ResponseTypes        Arguments        `json:"responseTypes" gorethink:"responseTypes"`
-	RedirectURI          *url.URL         `json:"redirectUri" gorethink:"redirectUri"`
-	State                string           `json:"state" gorethink:"state"`
-	HandledResponseTypes Arguments        `json:"handledResponseTypes" gorethink:"handledResponseTypes"`
-	ResponseMode         ResponseModeType `json:"ResponseModes" gorethink:"ResponseModes"`
-	DefaultResponseMode  ResponseModeType `json:"DefaultResponseMode" gorethink:"DefaultResponseMode"`
+	ResponseTypes        Arguments          `json:"responseTypes" gorethink:"responseTypes"`
+	RedirectURI          *url.URL           `json:"redirectUri" gorethink:"redirectUri"`
+	State                string             `json:"state" gorethink:"state"`
+	HandledResponseTypes Arguments          `json:"handledResponseTypes" gorethink:"handledResponseTypes"`
+	ResponseMode         ResponseModeType   `json:"ResponseModes" gorethink:"ResponseModes"`
+	DefaultResponseMode  ResponseModeType   `json:"DefaultResponseMode" gorethink:"DefaultResponseMode"`
+	RedirectURIMatcher   RedirectURIMatcher `json:"-" gorethink:"-"`
 
 	Request
 }
@@ -45,15 +46,22 @@ func (d *AuthorizeRequest) IsRedirectURIValid() bool {
 	}
 
 	raw := d.GetRedirectURI().String()
-	if d.GetClient() == nil {
-		return false
-	}
-
-	redirectURI, err := MatchRedirectURIWithClientRedirectURIs(raw, d.GetClient())
+	redirectURI, err := d.matchRedirectURI(raw)
 	if err != nil {
 		return false
 	}
 	return IsValidRedirectURI(redirectURI)
+}
+
+func (d *AuthorizeRequest) matchRedirectURI(rawurl string) (*url.URL, error) {
+	if d.GetClient() == nil {
+		return nil, ErrInvalidRequest
+	}
+	matcher := d.RedirectURIMatcher
+	if matcher == nil {
+		matcher = MatchRedirectURIWithClientRedirectURIs
+	}
+	return matcher(rawurl, d.GetClient())
 }
 
 func (d *AuthorizeRequest) GetResponseTypes() Arguments {

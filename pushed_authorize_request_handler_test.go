@@ -663,3 +663,52 @@ func TestNewPushedAuthorizeRequest(t *testing.T) {
 		})
 	}
 }
+
+func TestNewPushedAuthorizeRequestUsesRedirectURIMatcher(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	store := internal.NewMockStorage(ctrl)
+	hasher := internal.NewMockHasher(ctrl)
+	defer ctrl.Finish()
+
+	config := &Config{
+		ScopeStrategy:            ExactScopeStrategy,
+		AudienceMatchingStrategy: DefaultAudienceMatchingStrategy,
+		ClientSecretsHasher:      hasher,
+		RedirectURIMatcher: func(rawurl string, client Client) (*url.URL, error) {
+			if rawurl == "https://tenant.example.com/callback" && len(client.GetRedirectURIs()) == 1 && client.GetRedirectURIs()[0] == "https://*.example.com/callback" {
+				return url.Parse(rawurl)
+			}
+			return nil, ErrInvalidRequest
+		},
+	}
+
+	fosite := &Fosite{
+		Store:  store,
+		Config: config,
+	}
+
+	query := url.Values{
+		"redirect_uri":  {"https://tenant.example.com/callback"},
+		"client_id":     {"1234"},
+		"client_secret": {"1234"},
+		"response_type": {"code"},
+		"state":         {"strong-state"},
+	}
+	req := &http.Request{
+		Header: http.Header{},
+		Method: "POST",
+		URL:    &url.URL{RawQuery: query.Encode()},
+	}
+
+	store.EXPECT().GetClient(gomock.Any(), "1234").Return(&DefaultClient{
+		RedirectURIs:  []string{"https://*.example.com/callback"},
+		ResponseTypes: []string{"code"},
+		Secret:        []byte("1234"),
+	}, nil).MaxTimes(2)
+	hasher.EXPECT().Compare(gomock.Any(), gomock.Eq([]byte("1234")), gomock.Eq([]byte("1234"))).Return(nil)
+
+	ar, err := fosite.NewPushedAuthorizeRequest(NewContext(), req)
+	require.NoError(t, err)
+	require.Equal(t, "https://tenant.example.com/callback", ar.GetRedirectURI().String())
+	require.True(t, ar.IsRedirectURIValid())
+}
