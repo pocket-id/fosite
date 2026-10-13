@@ -79,7 +79,7 @@ func (d *DeviceAuthHandler) handleDeviceAuthSession(ctx context.Context, dar fos
 			return "", "", errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 		}
 
-		err = d.Storage.DeviceAuthStorage().CreateDeviceAuthSession(ctx, deviceCodeSignature, userCodeSignature, dar.Sanitize(nil).(fosite.DeviceRequester))
+		err = d.Storage.DeviceAuthStorage().CreateDeviceAuthSession(ctx, deviceCodeSignature, userCodeSignature, dar.Sanitize([]string{"nonce", "resource"}).(fosite.DeviceRequester))
 		if err == nil {
 			break
 		}
