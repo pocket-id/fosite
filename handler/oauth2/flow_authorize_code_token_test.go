@@ -397,13 +397,20 @@ func TestAuthorizeCode_HandleTokenEndpointRequest(t *testing.T) {
 					},
 					authreq: &fosite.AuthorizeRequest{
 						Request: fosite.Request{
-							Client:         &fosite.DefaultClient{ID: "foo", GrantTypes: []string{"authorization_code"}},
-							Session:        &fosite.DefaultSession{},
-							RequestedScope: fosite.Arguments{"a", "b"},
-							RequestedAt:    time.Now().UTC(),
+							Client:          &fosite.DefaultClient{ID: "foo", GrantTypes: []string{"authorization_code"}},
+							Session:         &fosite.DefaultSession{},
+							RequestedScope:  fosite.Arguments{"a", "b"},
+							RequestedAt:     time.Now().UTC(),
+							GrantedScope:    fosite.Arguments{"a"},
+							GrantedAudience: fosite.Arguments{"https://api.example.com"},
 						},
 					},
 					description: "should pass",
+					check: func(t *testing.T, areq *fosite.AccessRequest, authreq *fosite.AuthorizeRequest) {
+						assert.Equal(t, authreq.GetGrantedScopes(), areq.GetGrantedScopes())
+						assert.Equal(t, authreq.GetGrantedAudience(), areq.GetGrantedAudience())
+						assert.NotContains(t, areq.GetGrantedScopes(), "b")
+					},
 					setup: func(t *testing.T, areq *fosite.AccessRequest, authreq *fosite.AuthorizeRequest) {
 						token, signature, err := strategy.GenerateAuthorizeCode(context.Background(), nil)
 						require.NoError(t, err)

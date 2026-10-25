@@ -90,6 +90,14 @@ func (c *AuthorizeExplicitGrantHandler) HandleTokenEndpointRequest(ctx context.C
 	request.SetSession(authorizeRequest.GetSession())
 	request.SetID(authorizeRequest.GetID())
 
+	// Restore the consented grant before callers build scope-dependent claims between NewAccessRequest and NewAccessResponse
+	for _, scope := range authorizeRequest.GetGrantedScopes() {
+		request.GrantScope(scope)
+	}
+	for _, audience := range authorizeRequest.GetGrantedAudience() {
+		request.GrantAudience(audience)
+	}
+
 	atLifespan := fosite.GetEffectiveLifespan(request.GetClient(), fosite.GrantTypeAuthorizationCode, fosite.AccessToken, c.Config.GetAccessTokenLifespan(ctx))
 	request.GetSession().SetExpiresAt(fosite.AccessToken, time.Now().UTC().Add(atLifespan).Round(time.Second))
 
