@@ -193,6 +193,14 @@ func (c *DeviceCodeTokenEndpointHandler) HandleTokenEndpointRequest(ctx context.
 	requester.SetSession(ar.GetSession())
 	requester.SetID(ar.GetID())
 
+	// Restore the consented grant before callers build scope-dependent claims between NewAccessRequest and NewAccessResponse
+	for _, scope := range ar.GetGrantedScopes() {
+		requester.GrantScope(scope)
+	}
+	for _, audience := range ar.GetGrantedAudience() {
+		requester.GrantAudience(audience)
+	}
+
 	atLifespan := fosite.GetEffectiveLifespan(requester.GetClient(), c.getGrantType(requester), fosite.AccessToken, c.Config.GetAccessTokenLifespan(ctx))
 	requester.GetSession().SetExpiresAt(fosite.AccessToken, time.Now().UTC().Add(atLifespan).Round(time.Second))
 
