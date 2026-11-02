@@ -74,6 +74,7 @@ type AudienceStrategyProvider interface {
 type IgnoreUnknownScopesProvider interface {
 	// GetIgnoreUnknownScopes returns true if requested scopes that are not covered by the client's registered
 	// scopes should be silently dropped from the request instead of failing it with an invalid_scope error.
+	// A refresh then also drops granted scopes the client no longer has.
 	GetIgnoreUnknownScopes(ctx context.Context) bool
 }
 

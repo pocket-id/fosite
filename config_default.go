@@ -425,6 +425,7 @@ func (c *Config) GetScopeStrategy(_ context.Context) ScopeStrategy {
 
 // GetIgnoreUnknownScopes returns true if requested scopes that are not covered by the client's registered scopes
 // should be silently dropped from the request instead of failing it with an invalid_scope error. Defaults to false.
+// A refresh then also drops granted scopes the client no longer has.
 func (c *Config) GetIgnoreUnknownScopes(_ context.Context) bool {
 	return c.IgnoreUnknownScopes
 }

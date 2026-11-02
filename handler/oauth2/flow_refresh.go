@@ -36,6 +36,7 @@ type RefreshTokenGrantHandler struct {
 		fosite.ScopeStrategyProvider
 		fosite.AudienceStrategyProvider
 		fosite.RefreshTokenScopesProvider
+		fosite.IgnoreUnknownScopesProvider
 	}
 }
 
@@ -79,12 +80,6 @@ func (c *RefreshTokenGrantHandler) HandleTokenEndpointRequest(ctx context.Contex
 		return fosite.ErrInvalidRequest.WithWrap(err).WithDebug(err.Error())
 	}
 
-	if !(len(c.Config.GetRefreshTokenScopes(ctx)) == 0 || originalRequest.GetGrantedScopes().HasOneOf(c.Config.GetRefreshTokenScopes(ctx)...)) {
-		scopeNames := strings.Join(c.Config.GetRefreshTokenScopes(ctx), " or ")
-		hint := fmt.Sprintf("The OAuth 2.0 Client was not granted scope %s and may thus not perform the 'refresh_token' authorization grant.", scopeNames)
-		return errorsx.WithStack(fosite.ErrScopeNotGranted.WithHint(hint))
-	}
-
 	// The authorization server MUST ... and ensure that the refresh token was issued to the authenticated client
 	if originalRequest.GetClient().GetID() != request.GetClient().GetID() {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The OAuth 2.0 Client ID from this request does not match the ID during the initial token issuance."))
@@ -97,9 +92,20 @@ func (c *RefreshTokenGrantHandler) HandleTokenEndpointRequest(ctx context.Contex
 
 	for _, scope := range originalRequest.GetGrantedScopes() {
 		if !c.Config.GetScopeStrategy(ctx)(request.GetClient().GetScopes(), scope) {
+			// A scope the client lost since the grant is dropped like an unknown requested scope, so the refresh keeps the rest of the grant
+			if c.Config.GetIgnoreUnknownScopes(ctx) {
+				continue
+			}
 			return errorsx.WithStack(fosite.ErrInvalidScope.WithHintf("The OAuth 2.0 Client is not allowed to request scope '%s'.", scope))
 		}
 		request.GrantScope(scope)
+	}
+
+	// Checked after dropping lost scopes, so a client that lost the refresh token scope can't keep refreshing
+	if !(len(c.Config.GetRefreshTokenScopes(ctx)) == 0 || request.GetGrantedScopes().HasOneOf(c.Config.GetRefreshTokenScopes(ctx)...)) {
+		scopeNames := strings.Join(c.Config.GetRefreshTokenScopes(ctx), " or ")
+		hint := fmt.Sprintf("The OAuth 2.0 Client was not granted scope %s and may thus not perform the 'refresh_token' authorization grant.", scopeNames)
+		return errorsx.WithStack(fosite.ErrScopeNotGranted.WithHint(hint))
 	}
 
 	if err := c.Config.GetAudienceStrategy(ctx)(request.GetClient().GetAudience(), originalRequest.GetGrantedAudience()); err != nil {

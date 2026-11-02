@@ -186,6 +186,62 @@ func TestRefreshFlow_HandleTokenEndpointRequest(t *testing.T) {
 					},
 				},
 				{
+					description: "should drop a granted scope the client lost when unknown scopes are ignored",
+					setup: func(config *fosite.Config) {
+						config.IgnoreUnknownScopes = true
+						areq.GrantTypes = fosite.Arguments{"refresh_token"}
+						areq.Client = &fosite.DefaultClient{
+							ID:         "foo",
+							GrantTypes: fosite.Arguments{"refresh_token"},
+							Scopes:     []string{"foo", "offline"},
+						}
+
+						token, sig, err := strategy.GenerateRefreshToken(context.Background(), nil)
+						require.NoError(t, err)
+
+						areq.Form.Add("refresh_token", token)
+						err = store.CreateRefreshTokenSession(context.Background(), sig, "", &fosite.Request{
+							Client:         areq.Client,
+							GrantedScope:   fosite.Arguments{"foo", "bar", "offline"},
+							RequestedScope: fosite.Arguments{"foo", "bar", "offline"},
+							Session:        sess,
+							Form:           url.Values{"foo": []string{"bar"}},
+							RequestedAt:    time.Now().UTC().Add(-time.Hour).Round(time.Hour),
+						})
+						require.NoError(t, err)
+					},
+					expect: func(t *testing.T) {
+						assert.Equal(t, fosite.Arguments{"foo", "offline"}, areq.GrantedScope)
+					},
+				},
+				{
+					description: "should fail because the client lost the refresh token scope even when unknown scopes are ignored",
+					setup: func(config *fosite.Config) {
+						config.IgnoreUnknownScopes = true
+						areq.GrantTypes = fosite.Arguments{"refresh_token"}
+						areq.Client = &fosite.DefaultClient{
+							ID:         "foo",
+							GrantTypes: fosite.Arguments{"refresh_token"},
+							Scopes:     []string{"foo"},
+						}
+
+						token, sig, err := strategy.GenerateRefreshToken(context.Background(), nil)
+						require.NoError(t, err)
+
+						areq.Form.Add("refresh_token", token)
+						err = store.CreateRefreshTokenSession(context.Background(), sig, "", &fosite.Request{
+							Client:         areq.Client,
+							GrantedScope:   fosite.Arguments{"foo", "offline"},
+							RequestedScope: fosite.Arguments{"foo", "offline"},
+							Session:        sess,
+							Form:           url.Values{"foo": []string{"bar"}},
+							RequestedAt:    time.Now().UTC().Add(-time.Hour).Round(time.Hour),
+						})
+						require.NoError(t, err)
+					},
+					expectErr: fosite.ErrScopeNotGranted,
+				},
+				{
 					description: "should pass with custom client lifespans",
 					setup: func(config *fosite.Config) {
 						areq.GrantTypes = fosite.Arguments{"refresh_token"}
