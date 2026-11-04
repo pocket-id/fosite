@@ -97,7 +97,7 @@ func TestResourceOwnerFlow_HandleTokenEndpointRequest(t *testing.T) {
 			},
 			check: func(areq *fosite.AccessRequest) {
 				// assert.NotEmpty(t, areq.GetSession().GetExpiresAt(fosite.AccessToken))
-				assert.Equal(t, time.Now().Add(time.Hour).UTC().Round(time.Second), areq.GetSession().GetExpiresAt(fosite.AccessToken))
+				assert.Equal(t, time.Now().Add(time.Hour).UTC().Truncate(time.Second), areq.GetSession().GetExpiresAt(fosite.AccessToken))
 				assert.Equal(t, time.Now().Add(time.Hour).UTC().Round(time.Second), areq.GetSession().GetExpiresAt(fosite.RefreshToken))
 			},
 		},
