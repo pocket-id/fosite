@@ -289,11 +289,17 @@ func TestDeviceUserCode_HandleTokenEndpointRequest(t *testing.T) {
 								ID:         "foo",
 								GrantTypes: []string{"urn:ietf:params:oauth:grant-type:device_code"},
 							},
-							RequestedScope: fosite.Arguments{"foo"},
-							GrantedScope:   fosite.Arguments{"foo"},
-							Session:        &fosite.DefaultSession{},
-							RequestedAt:    time.Now().UTC(),
+							RequestedScope:  fosite.Arguments{"foo", "bar"},
+							GrantedScope:    fosite.Arguments{"foo"},
+							GrantedAudience: fosite.Arguments{"https://api.example.com"},
+							Session:         &fosite.DefaultSession{},
+							RequestedAt:     time.Now().UTC(),
 						},
+					},
+					check: func(t *testing.T, areq *fosite.AccessRequest, authreq *fosite.DeviceRequest) {
+						assert.Equal(t, authreq.GetGrantedScopes(), areq.GetGrantedScopes())
+						assert.Equal(t, authreq.GetGrantedAudience(), areq.GetGrantedAudience())
+						assert.NotContains(t, areq.GetGrantedScopes(), "bar")
 					},
 					setup: func(t *testing.T, areq *fosite.AccessRequest, authreq *fosite.DeviceRequest) {
 						token, signature, err := strategy.GenerateDeviceCode(context.TODO())
