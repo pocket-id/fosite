@@ -20,6 +20,17 @@ import (
 	"github.com/hashicorp/go-retryablehttp"
 )
 
+// ErrCIMDTemporarilyUnavailable marks a metadata document that could not be retrieved for a reason that may pass, such as a network error or a timeout
+// Such a failure says nothing about the client, so trust in it and its cached metadata should survive
+var ErrCIMDTemporarilyUnavailable = errors.New("client metadata document is temporarily unavailable")
+
+// ErrCIMDClientIDMismatch marks a retrieved document whose client_id is not the URL it was fetched from
+var ErrCIMDClientIDMismatch = errors.New("client_id does not match the client metadata document URL")
+
+// ErrCIMDFetchRefused marks a request for a metadata document that was refused because of where it would go
+// A transport that guards destinations itself returns an error matching it, so the refusal is not taken for a host that is temporarily unreachable
+var ErrCIMDFetchRefused = errors.New("request for the client metadata document was refused")
+
 // LooksLikeCIMDURL reports whether clientID is a candidate Client Identifier URL.
 //
 // A URL-shaped identifier is not necessarily backed by a Client ID Metadata
@@ -48,7 +59,7 @@ func ParseCIMDURL(clientID string) (*url.URL, error) {
 	return u, nil
 }
 
-// ValidateCIMDURL enforces the Client Identifier URL requirements from draft-ietf-oauth-client-id-metadata-document-02 section 3.
+// ValidateCIMDURL enforces the Client Identifier URL requirements from draft-ietf-oauth-client-id-metadata-document-03 section 3.
 func ValidateCIMDURL(u *url.URL) error {
 	if u == nil {
 		return errors.New("client_id URL is required")
@@ -68,8 +79,8 @@ func ValidateCIMDURL(u *url.URL) error {
 	if u.RawQuery != "" || u.ForceQuery {
 		return errors.New("client_id URL must not contain a query component")
 	}
-	if u.Path == "" {
-		return errors.New("client_id URL must contain a path component")
+	if u.Path == "" || u.Path == "/" {
+		return errors.New("client_id URL must contain a path component other than /")
 	}
 	for seg := range strings.SplitSeq(u.Path, "/") {
 		if seg == "." || seg == ".." {
@@ -84,28 +95,29 @@ func ValidateCIMDURL(u *url.URL) error {
 // AdditionalMetadata preserves registered extensions and future metadata members
 // that this version of Fosite does not interpret.
 type ClientMetadataDocument struct {
-	ClientID                      string                     `json:"client_id"`
-	RedirectURIs                  []string                   `json:"redirect_uris"`
-	TokenEndpointAuthMethod       string                     `json:"token_endpoint_auth_method"`
-	GrantTypes                    []string                   `json:"grant_types"`
-	ResponseTypes                 []string                   `json:"response_types"`
-	ClientName                    string                     `json:"client_name"`
-	ClientURI                     string                     `json:"client_uri"`
-	LogoURI                       string                     `json:"logo_uri"`
-	Scope                         string                     `json:"scope"`
-	Contacts                      []string                   `json:"contacts"`
-	TOSURI                        string                     `json:"tos_uri"`
-	PolicyURI                     string                     `json:"policy_uri"`
-	JWKSURI                       string                     `json:"jwks_uri"`
-	JWKS                          *jose.JSONWebKeySet        `json:"jwks"`
-	SoftwareID                    string                     `json:"software_id"`
-	SoftwareVersion               string                     `json:"software_version"`
-	SoftwareStatement             string                     `json:"software_statement"`
-	RequestURIs                   []string                   `json:"request_uris"`
-	RequestObjectSigningAlgorithm string                     `json:"request_object_signing_alg"`
-	TokenEndpointAuthSigningAlg   string                     `json:"token_endpoint_auth_signing_alg"`
-	PostLogoutRedirectURIs        []string                   `json:"post_logout_redirect_uris"`
-	AdditionalMetadata            map[string]json.RawMessage `json:"-"`
+	ClientID                          string                     `json:"client_id"`
+	RedirectURIs                      []string                   `json:"redirect_uris"`
+	TokenEndpointAuthMethod           string                     `json:"token_endpoint_auth_method"`
+	TokenEndpointAuthMethodsSupported []string                   `json:"token_endpoint_auth_methods_supported"`
+	GrantTypes                        []string                   `json:"grant_types"`
+	ResponseTypes                     []string                   `json:"response_types"`
+	ClientName                        string                     `json:"client_name"`
+	ClientURI                         string                     `json:"client_uri"`
+	LogoURI                           string                     `json:"logo_uri"`
+	Scope                             string                     `json:"scope"`
+	Contacts                          []string                   `json:"contacts"`
+	TOSURI                            string                     `json:"tos_uri"`
+	PolicyURI                         string                     `json:"policy_uri"`
+	JWKSURI                           string                     `json:"jwks_uri"`
+	JWKS                              *jose.JSONWebKeySet        `json:"jwks"`
+	SoftwareID                        string                     `json:"software_id"`
+	SoftwareVersion                   string                     `json:"software_version"`
+	SoftwareStatement                 string                     `json:"software_statement"`
+	RequestURIs                       []string                   `json:"request_uris"`
+	RequestObjectSigningAlgorithm     string                     `json:"request_object_signing_alg"`
+	TokenEndpointAuthSigningAlg       string                     `json:"token_endpoint_auth_signing_alg"`
+	PostLogoutRedirectURIs            []string                   `json:"post_logout_redirect_uris"`
+	AdditionalMetadata                map[string]json.RawMessage `json:"-"`
 
 	// Presence of these values is forbidden by the CIMD credential restrictions.
 	ClientSecret          *string `json:"client_secret"`
@@ -141,6 +153,7 @@ var clientMetadataDocumentKnownFields = []string{
 	"client_id",
 	"redirect_uris",
 	"token_endpoint_auth_method",
+	"token_endpoint_auth_methods_supported",
 	"grant_types",
 	"response_types",
 	"client_name",
@@ -163,29 +176,47 @@ var clientMetadataDocumentKnownFields = []string{
 	"client_secret_expires_at",
 }
 
+// TokenEndpointAuthMethods returns the token endpoint authentication methods the client declares, of which the authorization server picks one it supports
+// The token_endpoint_auth_methods_supported list replaces the legacy token_endpoint_auth_method, and a document with neither declares "none" instead of the RFC 7591 default
+func (d *ClientMetadataDocument) TokenEndpointAuthMethods() []string {
+	if d.TokenEndpointAuthMethodsSupported != nil {
+		return d.TokenEndpointAuthMethodsSupported
+	}
+	if d.TokenEndpointAuthMethod != "" {
+		return []string{d.TokenEndpointAuthMethod}
+	}
+	return []string{"none"}
+}
+
 // Validate checks the protocol-level CIMD invariants against the URL used to retrieve the document.
 func (d *ClientMetadataDocument) Validate(clientID string) error {
 	if d == nil {
 		return errors.New("client metadata document is required")
 	}
-	if d.ClientID == "" {
-		return errors.New("client metadata document must contain client_id")
-	}
 	if _, err := ParseCIMDURL(clientID); err != nil {
 		return fmt.Errorf("invalid client_id in metadata document: %w", err)
 	}
+	// A document without a client_id is malformed, which unlike a mismatch says nothing about who controls the URL
+	if d.ClientID == "" {
+		return errors.New("client metadata document must contain a client_id")
+	}
 	if d.ClientID != clientID {
-		return fmt.Errorf("client_id %q does not match document URL %q", d.ClientID, clientID)
+		return fmt.Errorf("%w: the document at %q declares %q", ErrCIMDClientIDMismatch, clientID, d.ClientID)
+	}
+
+	// An omitted list takes its RFC 7591 default, but an explicitly empty one declares nothing the server could support
+	if (d.GrantTypes != nil && len(d.GrantTypes) == 0) || (d.ResponseTypes != nil && len(d.ResponseTypes) == 0) {
+		return errors.New("client metadata document must not contain an empty grant_types or response_types")
 	}
 	if d.ClientSecret != nil || d.ClientSecretExpiresAt != nil {
 		return errors.New("client metadata document must not contain a client secret")
 	}
-	if d.TokenEndpointAuthMethod == "" {
-		return errors.New("client metadata document must explicitly set token_endpoint_auth_method because the RFC 7591 default client_secret_basic is not permitted")
-	}
-	switch d.TokenEndpointAuthMethod {
-	case "client_secret_basic", "client_secret_post", "client_secret_jwt":
-		return fmt.Errorf("client metadata document must not use symmetric authentication method %q", d.TokenEndpointAuthMethod)
+	// A document cannot establish a shared secret, so neither field may name a symmetric method
+	for _, method := range append([]string{d.TokenEndpointAuthMethod}, d.TokenEndpointAuthMethodsSupported...) {
+		switch method {
+		case "client_secret_basic", "client_secret_post", "client_secret_jwt":
+			return fmt.Errorf("client metadata document must not use symmetric authentication method %q", method)
+		}
 	}
 	if d.JWKS != nil && d.JWKSURI != "" {
 		return errors.New("client metadata document must not contain both jwks and jwks_uri")
@@ -197,7 +228,7 @@ func (d *ClientMetadataDocument) Validate(clientID string) error {
 			}
 		}
 	}
-	if d.TokenEndpointAuthMethod == "private_key_jwt" && d.JWKS == nil && d.JWKSURI == "" {
+	if slices.Contains(d.TokenEndpointAuthMethods(), "private_key_jwt") && d.JWKS == nil && d.JWKSURI == "" {
 		return errors.New("private_key_jwt requires jwks or jwks_uri")
 	}
 	return d.validateRedirectURIs()
@@ -270,7 +301,15 @@ func NewCIMDClient(doc *ClientMetadataDocument) (*CIMDClient, error) {
 		return nil, err
 	}
 
-	authMethod := doc.TokenEndpointAuthMethod
+	// A client that declares private_key_jwt must authenticate with it, and every other client has to be usable as a public one
+	methods := doc.TokenEndpointAuthMethods()
+	authMethod := "none"
+	if slices.Contains(methods, "private_key_jwt") {
+		authMethod = "private_key_jwt"
+	} else if !slices.Contains(methods, "none") {
+		return nil, fmt.Errorf("client metadata document declares no supported token endpoint authentication method: %q", methods)
+	}
+
 	grantTypes := append([]string(nil), doc.GrantTypes...)
 	if len(grantTypes) == 0 {
 		grantTypes = []string{"authorization_code"}

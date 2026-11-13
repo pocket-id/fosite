@@ -58,6 +58,12 @@ var specialUseIPNets = parseCIMDSpecialUseRanges([]string{
 	"ff00::/8",
 })
 
+// Refusals by the fetcher's own rules, which stay terminal while every other failure to reach a document may pass
+var (
+	errCIMDRedirect     = errors.New("redirects are not allowed when fetching client metadata")
+	errCIMDSpecialUseIP = errors.New("special-use IP addresses are not allowed")
+)
+
 // CIMDFetcher retrieves and validates the Client ID Metadata Document located
 // at a client_id URL.
 type CIMDFetcher interface {
@@ -83,6 +89,7 @@ type DefaultCIMDFetcher struct {
 
 	maxSize    int64
 	timeout    time.Duration
+	minTTL     time.Duration
 	maxTTL     time.Duration
 	defaultTTL time.Duration
 
@@ -126,6 +133,12 @@ func WithCIMDCacheTTLBounds(maxTTL, defaultTTL time.Duration) CIMDFetcherOption 
 	}
 }
 
+// WithCIMDMinCacheTTL sets a lifetime every document is cached for, whatever its response headers say
+// This bounds how often a client can make the server fetch its document, and lets a cache that cannot evict accept documents served with no-store
+func WithCIMDMinCacheTTL(minTTL time.Duration) CIMDFetcherOption {
+	return func(f *DefaultCIMDFetcher) { f.minTTL = minTTL }
+}
+
 // WithCIMDAllowPrivateIPs disables SSRF protection, allowing documents to be
 // fetched from private, loopback, or link-local addresses.
 func WithCIMDAllowPrivateIPs(allow bool) CIMDFetcherOption {
@@ -167,7 +180,7 @@ var _ CIMDSecureHTTPClientProvider = (*DefaultCIMDFetcher)(nil)
 func (f *DefaultCIMDFetcher) buildHTTPClient() *http.Client {
 	c := &http.Client{
 		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return errors.New("redirects are not allowed when fetching client metadata")
+			return errCIMDRedirect
 		},
 	}
 
@@ -225,7 +238,7 @@ func (f *DefaultCIMDFetcher) guardTransport(tr *http.Transport) http.RoundTrippe
 				return fmt.Errorf("could not parse dialed address %q", address)
 			}
 			if f.isSpecialUseIP(ip) {
-				return errors.New("special-use IP addresses are not allowed")
+				return errCIMDSpecialUseIP
 			}
 			return nil
 		},
@@ -244,10 +257,7 @@ func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*Clien
 	defer cancel()
 
 	if err := f.validateResolvedURL(ctx, u); err != nil {
-		if ctx.Err() != nil {
-			return nil, CIMDCachePolicy{}, ctx.Err()
-		}
-		return nil, CIMDCachePolicy{}, err
+		return nil, CIMDCachePolicy{}, cimdUnreachableError(ctx, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clientID, nil)
@@ -259,15 +269,16 @@ func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*Clien
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, CIMDCachePolicy{}, ctx.Err()
-		}
-		return nil, CIMDCachePolicy{}, err
+		return nil, CIMDCachePolicy{}, cimdUnreachableError(ctx, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		err := fmt.Errorf("unexpected status %d fetching client metadata", resp.StatusCode)
+		// A server error or a rate limit says nothing about the document itself
+		if resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusTooManyRequests {
+			err = fmt.Errorf("%w: %w", ErrCIMDTemporarilyUnavailable, err)
+		}
 		return nil, CIMDCachePolicy{}, err
 	}
 	if err := validateCIMDContentType(resp.Header.Get("Content-Type")); err != nil {
@@ -276,7 +287,7 @@ func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*Clien
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, f.maxSize+1))
 	if err != nil {
-		return nil, CIMDCachePolicy{}, err
+		return nil, CIMDCachePolicy{}, cimdUnreachableError(ctx, err)
 	}
 	if int64(len(body)) > f.maxSize {
 		return nil, CIMDCachePolicy{}, errors.New("client metadata document exceeds maximum size")
@@ -293,14 +304,25 @@ func (f *DefaultCIMDFetcher) Fetch(ctx context.Context, clientID string) (*Clien
 	return &doc, f.parseCachePolicy(resp.Header, time.Now()), nil
 }
 
+// cimdUnreachableError marks a failure to retrieve the document as temporary, unless the fetcher itself refused the request
+func cimdUnreachableError(ctx context.Context, err error) error {
+	if errors.Is(err, errCIMDRedirect) || errors.Is(err, errCIMDSpecialUseIP) || errors.Is(err, ErrCIMDFetchRefused) {
+		return err
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return fmt.Errorf("%w: %w", ErrCIMDTemporarilyUnavailable, err)
+}
+
 // parseCachePolicy derives a bounded freshness lifetime and whether the response may be stored.
 func (f *DefaultCIMDFetcher) parseCachePolicy(header http.Header, now time.Time) CIMDCachePolicy {
 	directives := parseCIMDCacheControl(header.Values("Cache-Control"))
 	if _, noStore := directives["no-store"]; noStore {
-		return CIMDCachePolicy{}
+		return CIMDCachePolicy{TTL: f.minTTL, Store: f.minTTL > 0}
 	}
 
-	policy := CIMDCachePolicy{Store: true}
+	policy := CIMDCachePolicy{TTL: f.minTTL, Store: true}
 	if _, noCache := directives["no-cache"]; noCache {
 		return policy
 	}
@@ -310,12 +332,16 @@ func (f *DefaultCIMDFetcher) parseCachePolicy(header http.Header, now time.Time)
 		freshness = boundedCacheDuration(seconds, f.maxTTL)
 	} else if seconds, ok := cacheDirectiveSeconds(directives, "max-age"); ok {
 		freshness = boundedCacheDuration(seconds, f.maxTTL)
-	} else if expires, err := http.ParseTime(header.Get("Expires")); err == nil {
-		date := now
-		if parsedDate, err := http.ParseTime(header.Get("Date")); err == nil {
-			date = parsedDate
+	} else if expires := header.Get("Expires"); expires != "" {
+		// RFC 9111 section 5.3 reads an Expires value that is not a date, such as 0, as already expired
+		freshness = 0
+		if expiresAt, err := http.ParseTime(expires); err == nil {
+			date := now
+			if parsedDate, err := http.ParseTime(header.Get("Date")); err == nil {
+				date = parsedDate
+			}
+			freshness = expiresAt.Sub(date)
 		}
-		freshness = expires.Sub(date)
 	}
 	if freshness > f.maxTTL {
 		freshness = f.maxTTL
@@ -331,7 +357,7 @@ func (f *DefaultCIMDFetcher) parseCachePolicy(header http.Header, now time.Time)
 	if date, err := http.ParseTime(header.Get("Date")); err == nil && now.After(date) && now.Sub(date) > currentAge {
 		currentAge = now.Sub(date)
 	}
-	policy.TTL = max(0, freshness-currentAge)
+	policy.TTL = max(f.minTTL, freshness-currentAge)
 	return policy
 }
 
@@ -404,7 +430,7 @@ func (f *DefaultCIMDFetcher) validateResolvedURL(ctx context.Context, u *url.URL
 		return err
 	}
 	if special {
-		return errors.New("special-use IP addresses are not allowed")
+		return errCIMDSpecialUseIP
 	}
 	return nil
 }

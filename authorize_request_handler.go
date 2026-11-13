@@ -499,6 +499,9 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 
 	client, err := f.resolveClient(ctx, request.GetRequestForm().Get("client_id"))
 	if err != nil {
+		if errors.Is(err, ErrCIMDTemporarilyUnavailable) {
+			return request, errorsx.WithStack(clientLookupError(err))
+		}
 		hint := "The requested OAuth 2.0 Client does not exist."
 		if errors.Is(err, errCIMDNoStoreUnsupported) {
 			hint = "The client metadata document uses Cache-Control: no-store, but this authorization server requires metadata caching. Allow the document to be cached and try again."

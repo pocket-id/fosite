@@ -6,6 +6,7 @@ package fosite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -27,6 +28,12 @@ func (m *cimdMockRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 		return resp, nil
 	}
 	return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header)}, nil
+}
+
+type failingRoundTripper struct{ err error }
+
+func (f failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, f.err
 }
 
 func cimdMockResponse(status int, body string) *http.Response {
@@ -66,12 +73,29 @@ func TestDefaultCIMDFetcher_Fetch(t *testing.T) {
 		f := newTestFetcher(map[string]*http.Response{id: cimdMockResponse(http.StatusNotFound, "nope")})
 		_, _, err := f.Fetch(t.Context(), id)
 		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrCIMDTemporarilyUnavailable)
 	})
 
-	t.Run("service unavailable is an error", func(t *testing.T) {
-		f := newTestFetcher(map[string]*http.Response{id: cimdMockResponse(http.StatusServiceUnavailable, "nope")})
+	t.Run("server errors and rate limits are temporary", func(t *testing.T) {
+		for _, status := range []int{http.StatusServiceUnavailable, http.StatusTooManyRequests} {
+			f := newTestFetcher(map[string]*http.Response{id: cimdMockResponse(status, "nope")})
+			_, _, err := f.Fetch(t.Context(), id)
+			require.ErrorIs(t, err, ErrCIMDTemporarilyUnavailable)
+		}
+	})
+
+	t.Run("network failure is temporary", func(t *testing.T) {
+		f := NewDefaultCIMDFetcher(cimdMockTransport(failingRoundTripper{errRoundTrip}))
 		_, _, err := f.Fetch(t.Context(), id)
-		require.Error(t, err)
+		require.ErrorIs(t, err, ErrCIMDTemporarilyUnavailable)
+		require.ErrorIs(t, err, errRoundTrip)
+	})
+
+	t.Run("destination refused by the transport is not temporary", func(t *testing.T) {
+		f := NewDefaultCIMDFetcher(cimdMockTransport(failingRoundTripper{fmt.Errorf("%w: blocked address", ErrCIMDFetchRefused)}))
+		_, _, err := f.Fetch(t.Context(), id)
+		require.ErrorIs(t, err, ErrCIMDFetchRefused)
+		require.NotErrorIs(t, err, ErrCIMDTemporarilyUnavailable)
 	})
 
 	t.Run("oversize body is rejected", func(t *testing.T) {
@@ -92,14 +116,15 @@ func TestDefaultCIMDFetcher_Fetch(t *testing.T) {
 		redir.Header.Set("Location", "https://8.8.8.8/elsewhere")
 		f := newTestFetcher(map[string]*http.Response{id: redir})
 		_, _, err := f.Fetch(t.Context(), id)
-		require.Error(t, err)
+		require.ErrorIs(t, err, errCIMDRedirect)
+		require.NotErrorIs(t, err, ErrCIMDTemporarilyUnavailable)
 	})
 
 	t.Run("client_id mismatch is rejected", func(t *testing.T) {
 		mismatch := `{"client_id":"https://evil.example.com/c","token_endpoint_auth_method":"none"}`
 		f := newTestFetcher(map[string]*http.Response{id: cimdMockResponse(http.StatusOK, mismatch)})
 		_, _, err := f.Fetch(t.Context(), id)
-		require.Error(t, err)
+		require.ErrorIs(t, err, ErrCIMDClientIDMismatch)
 	})
 
 	t.Run("invalid client_id URL is rejected before fetching", func(t *testing.T) {
@@ -111,8 +136,8 @@ func TestDefaultCIMDFetcher_Fetch(t *testing.T) {
 	t.Run("private url is rejected", func(t *testing.T) {
 		f := NewDefaultCIMDFetcher()
 		_, _, err := f.Fetch(t.Context(), "https://127.0.0.1/oauth/client")
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "special-use IP addresses are not allowed")
+		require.ErrorIs(t, err, errCIMDSpecialUseIP)
+		require.NotErrorIs(t, err, ErrCIMDTemporarilyUnavailable)
 	})
 
 	t.Run("non-JSON content type is rejected", func(t *testing.T) {
@@ -148,6 +173,7 @@ func TestDefaultCIMDFetcher_ParseCachePolicy(t *testing.T) {
 		{name: "overflowing age expires entry", header: http.Header{"Cache-Control": {"max-age=600"}, "Age": {"9223372036854775807"}}, expected: CIMDCachePolicy{Store: true}},
 		{name: "s maxage wins", header: http.Header{"Cache-Control": {"max-age=600, s-maxage=120"}}, expected: CIMDCachePolicy{TTL: 2 * time.Minute, Store: true}},
 		{name: "expires", header: http.Header{"Date": {now.Format(http.TimeFormat)}, "Expires": {now.Add(15 * time.Minute).Format(http.TimeFormat)}}, expected: CIMDCachePolicy{TTL: 15 * time.Minute, Store: true}},
+		{name: "invalid expires is already expired", header: http.Header{"Expires": {"0"}}, expected: CIMDCachePolicy{Store: true}},
 	}
 
 	for _, tc := range tests {
@@ -155,6 +181,17 @@ func TestDefaultCIMDFetcher_ParseCachePolicy(t *testing.T) {
 			assert.Equal(t, tc.expected, f.parseCachePolicy(tc.header, now))
 		})
 	}
+}
+
+func TestDefaultCIMDFetcher_MinCacheTTL(t *testing.T) {
+	f := NewDefaultCIMDFetcher(WithCIMDMinCacheTTL(time.Minute))
+	now := time.Date(2026, time.July, 29, 12, 0, 0, 0, time.UTC)
+
+	// Every header that asks for less than the minimum is stored for the minimum, including the ones that forbid storing
+	for _, cacheControl := range []string{"no-store", "no-cache", "max-age=0", "max-age=1"} {
+		assert.Equal(t, CIMDCachePolicy{TTL: time.Minute, Store: true}, f.parseCachePolicy(http.Header{"Cache-Control": {cacheControl}}, now), cacheControl)
+	}
+	assert.Equal(t, CIMDCachePolicy{TTL: 10 * time.Minute, Store: true}, f.parseCachePolicy(http.Header{"Cache-Control": {"max-age=600"}}, now))
 }
 
 func TestDefaultCIMDFetcher_IsPrivateIP(t *testing.T) {

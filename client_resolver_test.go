@@ -6,8 +6,10 @@ package fosite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -153,6 +155,56 @@ func TestCIMDResolver(t *testing.T) {
 
 		_, err := resolver.ResolveClient(t.Context(), id, notFound)
 		require.ErrorContains(t, err, "client metadata endpoint is unavailable")
+	})
+
+	t.Run("temporarily unavailable document keeps expired metadata in use for the grace period", func(t *testing.T) {
+		stale := &DefaultClient{ID: id}
+		unavailable := fmt.Errorf("%w: connection refused", ErrCIMDTemporarilyUnavailable)
+		resolve := func(expiredFor time.Duration, fetchErr error) (Client, error) {
+			resolver := &CIMDResolver{
+				Fetcher:            &stubCIMDFetcher{err: fetchErr},
+				Cache:              &stubCIMDCache{clients: map[string]CIMDCachedClient{id: {Client: stale, ExpiresAt: now.Add(-expiredFor)}}},
+				Now:                func() time.Time { return now },
+				StaleIfUnavailable: time.Hour,
+			}
+			return resolver.ResolveClient(t.Context(), id, notFound)
+		}
+
+		client, err := resolve(time.Minute, unavailable)
+		require.NoError(t, err)
+		assert.Same(t, stale, client)
+
+		_, err = resolve(2*time.Hour, unavailable)
+		require.ErrorIs(t, err, ErrCIMDTemporarilyUnavailable)
+
+		// A document that was retrieved and rejected does say something about the client
+		_, err = resolve(time.Minute, errors.New("invalid client metadata JSON"))
+		require.ErrorContains(t, err, "invalid client metadata JSON")
+	})
+
+	t.Run("failed discovery is not repeated within the retry interval", func(t *testing.T) {
+		current := now
+		fetcher := &stubCIMDFetcher{err: errors.New("invalid client metadata JSON")}
+		cache := &stubCIMDCache{clients: map[string]CIMDCachedClient{
+			id: {Client: &DefaultClient{ID: id}, ExpiresAt: now.Add(-time.Minute)},
+		}}
+		resolver := &CIMDResolver{Fetcher: fetcher, Cache: cache, Now: func() time.Time { return current }, RetryAfterFailure: time.Minute}
+
+		for range 2 {
+			_, err := resolver.ResolveClient(t.Context(), id, notFound)
+			require.ErrorContains(t, err, "invalid client metadata JSON")
+		}
+		assert.Equal(t, 1, fetcher.calls)
+
+		// A forced refresh is how a fixed document is picked up, so it fetches regardless
+		_, err := resolver.RefreshClient(t.Context(), id)
+		require.Error(t, err)
+		assert.Equal(t, 2, fetcher.calls)
+
+		current = now.Add(2 * time.Minute)
+		_, err = resolver.ResolveClient(t.Context(), id, notFound)
+		require.Error(t, err)
+		assert.Equal(t, 3, fetcher.calls)
 	})
 
 	t.Run("policy rejects before fetching", func(t *testing.T) {
@@ -312,6 +364,26 @@ func TestCIMDResolver_NoStoreFailureHasFriendlyAuthorizeError(t *testing.T) {
 	var oauthErr *RFC6749Error
 	require.ErrorAs(t, err, &oauthErr)
 	assert.Equal(t, "The client metadata document uses Cache-Control: no-store, but this authorization server requires metadata caching. Allow the document to be cached and try again.", oauthErr.Reason())
+}
+
+func TestCIMDResolver_TemporaryFailureIsNotAnInvalidClient(t *testing.T) {
+	const id = "https://app.example.com/oauth/client"
+	provider := &Fosite{Store: &resolverTestStore{}, Config: &Config{
+		ClientResolver: ClientResolverFunc(func(context.Context, string, ClientLookupFunc) (Client, error) {
+			return nil, fmt.Errorf("fetch client metadata: %w", ErrCIMDTemporarilyUnavailable)
+		}),
+	}}
+
+	// The authorization endpoint must not report an unknown client
+	_, err := provider.NewAuthorizeRequest(t.Context(), httptest.NewRequest(http.MethodGet, "/authorize?client_id="+url.QueryEscape(id), nil))
+	require.ErrorIs(t, err, ErrTemporarilyUnavailable)
+
+	// The token endpoint answers with a 503 so the client keeps its tokens and retries
+	form := url.Values{"client_id": {id}}
+	_, err = provider.DefaultClientAuthenticationStrategy(t.Context(), httptest.NewRequest(http.MethodPost, "/token", nil), form)
+	var oauthErr *RFC6749Error
+	require.ErrorAs(t, err, &oauthErr)
+	assert.Equal(t, http.StatusServiceUnavailable, oauthErr.CodeField)
 }
 
 // blockingCIMDFetcher reports the liveness of the context it is called with, after the caller that

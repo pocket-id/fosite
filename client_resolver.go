@@ -49,6 +49,16 @@ func (f *Fosite) resolveClient(ctx context.Context, clientID string) (Client, er
 	return next(ctx, clientID)
 }
 
+// clientLookupError maps a failed client lookup to the error the caller is answered with
+// A metadata document that is temporarily unreachable says nothing about the client, so the caller is asked to retry instead of being told the client is invalid
+func clientLookupError(err error) *RFC6749Error {
+	rfcErr := ErrInvalidClient
+	if errors.Is(err, ErrCIMDTemporarilyUnavailable) {
+		rfcErr = ErrTemporarilyUnavailable.WithHint("The client metadata document could not be retrieved. Try again later.")
+	}
+	return rfcErr.WithWrap(err).WithDebug(err.Error())
+}
+
 // CIMDCachePolicy contains the response cache semantics needed by the resolver.
 type CIMDCachePolicy struct {
 	TTL   time.Duration
@@ -123,17 +133,33 @@ type CIMDResolver struct {
 	Policy                   CIMDClientPolicy
 	Now                      func() time.Time
 	MaxConcurrentDiscoveries int
+	// StaleIfUnavailable is how long expired metadata stays usable while its document is temporarily unavailable
+	StaleIfUnavailable time.Duration
+	// RetryAfterFailure is how long a client ID is not fetched again after its discovery failed, during which it is answered with the same error
+	RetryAfterFailure time.Duration
 
 	group    singleflight.Group
 	initOnce sync.Once
 	slots    chan struct{}
 
+	failuresMu sync.Mutex
+	failures   map[string]cimdFailure
+
 	jwksOnce    sync.Once
 	jwksFetcher JWKSFetcherStrategy
 }
 
-// acquire blocks until a discovery slot is free, or the context is done.
-func (r *CIMDResolver) acquire(ctx context.Context) (release func(), err error) {
+// cimdMaxRememberedFailures bounds the memory that failed discoveries of made-up client IDs can take
+const cimdMaxRememberedFailures = 1024
+
+type cimdFailure struct {
+	err   error
+	until time.Time
+}
+
+// acquire takes a discovery slot, and fails right away when all are taken
+// Waiting instead would let a few slow documents hold up every other discovery, while failing lets a known client fall back to its expired metadata
+func (r *CIMDResolver) acquire() (release func(), err error) {
 	r.initOnce.Do(func() {
 		if r.MaxConcurrentDiscoveries > 0 {
 			r.slots = make(chan struct{}, r.MaxConcurrentDiscoveries)
@@ -145,8 +171,8 @@ func (r *CIMDResolver) acquire(ctx context.Context) (release func(), err error) 
 	select {
 	case r.slots <- struct{}{}:
 		return func() { <-r.slots }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	default:
+		return nil, fmt.Errorf("%w: too many discoveries are in progress", ErrCIMDTemporarilyUnavailable)
 	}
 }
 
@@ -178,6 +204,10 @@ func (r *CIMDResolver) ResolveClient(ctx context.Context, clientID string, next 
 			return r.configureClient(cached.Client)
 		}
 		client, err := r.discover(ctx, clientID, next, true)
+		// A document that cannot be retrieved says nothing about the client, so its expired metadata stays in use for a while
+		if errors.Is(err, ErrCIMDTemporarilyUnavailable) && r.now().Before(cached.ExpiresAt.Add(r.StaleIfUnavailable)) {
+			return r.configureClient(cached.Client)
+		}
 		return client, err
 	}
 
@@ -193,6 +223,11 @@ func (r *CIMDResolver) RefreshClient(ctx context.Context, clientID string) (Clie
 	if !found {
 		return nil, ErrNotFound
 	}
+
+	// A forced refresh is how a fixed document is picked up, so it must not be answered with a remembered failure
+	r.failuresMu.Lock()
+	delete(r.failures, clientID)
+	r.failuresMu.Unlock()
 	return r.discover(ctx, clientID, nil, true)
 }
 
@@ -232,7 +267,40 @@ func (r *CIMDResolver) discover(ctx context.Context, clientID string, next Clien
 	}
 }
 
-func (r *CIMDResolver) fetchAndMaterialize(ctx context.Context, clientID string) (Client, error) {
+// recentFailure returns the error of a discovery that failed within the retry interval
+func (r *CIMDResolver) recentFailure(clientID string) error {
+	r.failuresMu.Lock()
+	defer r.failuresMu.Unlock()
+
+	failure, found := r.failures[clientID]
+	if !found {
+		return nil
+	}
+	if !r.now().Before(failure.until) {
+		delete(r.failures, clientID)
+		return nil
+	}
+	return failure.err
+}
+
+func (r *CIMDResolver) rememberFailure(clientID string, err error) {
+	if r.RetryAfterFailure <= 0 {
+		return
+	}
+	r.failuresMu.Lock()
+	defer r.failuresMu.Unlock()
+
+	// Forgetting everything when full is enough, because the memory only spares requests and decides nothing
+	if len(r.failures) >= cimdMaxRememberedFailures {
+		clear(r.failures)
+	}
+	if r.failures == nil {
+		r.failures = map[string]cimdFailure{}
+	}
+	r.failures[clientID] = cimdFailure{err: err, until: r.now().Add(r.RetryAfterFailure)}
+}
+
+func (r *CIMDResolver) fetchAndMaterialize(ctx context.Context, clientID string) (client Client, err error) {
 	if r.Fetcher == nil {
 		return nil, errors.New("CIMD fetcher is required")
 	}
@@ -243,11 +311,23 @@ func (r *CIMDResolver) fetchAndMaterialize(ctx context.Context, clientID string)
 		return nil, err
 	}
 
-	release, err := r.acquire(ctx)
+	// A client ID that failed a moment ago is not fetched again, so nobody can make the server request the same document over and over
+	if err := r.recentFailure(clientID); err != nil {
+		return nil, err
+	}
+
+	release, err := r.acquire()
 	if err != nil {
 		return nil, err
 	}
 	defer release()
+
+	// A failure is remembered unless the request that asked for the discovery went away, which says nothing about the document
+	defer func() {
+		if err != nil && ctx.Err() == nil {
+			r.rememberFailure(clientID, err)
+		}
+	}()
 	document, cachePolicy, err := r.Fetcher.Fetch(ctx, clientID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch client metadata: %w", err)
@@ -258,7 +338,7 @@ func (r *CIMDResolver) fetchAndMaterialize(ctx context.Context, clientID string)
 		}
 	}
 
-	client, err := r.materialize(ctx, document)
+	client, err = r.materialize(ctx, document)
 	if err != nil {
 		return nil, fmt.Errorf("materialize client metadata: %w", err)
 	}

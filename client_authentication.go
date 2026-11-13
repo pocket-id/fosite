@@ -124,7 +124,7 @@ func (f *Fosite) DefaultClientAuthenticationStrategy(ctx context.Context, r *htt
 
 			client, err = f.resolveClient(ctx, clientID)
 			if err != nil {
-				return nil, errorsx.WithStack(ErrInvalidClient.WithWrap(err).WithDebug(err.Error()))
+				return nil, errorsx.WithStack(clientLookupError(err))
 			}
 
 			oidcClient, ok := client.(OpenIDConnectClient)
@@ -239,7 +239,7 @@ func (f *Fosite) DefaultClientAuthenticationStrategy(ctx context.Context, r *htt
 
 	client, err := f.resolveClient(ctx, clientID)
 	if err != nil {
-		return nil, errorsx.WithStack(ErrInvalidClient.WithWrap(err).WithDebug(err.Error()))
+		return nil, errorsx.WithStack(clientLookupError(err))
 	}
 
 	if oidcClient, ok := client.(OpenIDConnectClient); !ok {

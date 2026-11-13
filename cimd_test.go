@@ -4,7 +4,6 @@
 package fosite
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -38,7 +37,6 @@ func TestValidateCIMDURL(t *testing.T) {
 		// NOT equivalent to one without it, so both forms are valid and distinct identifiers.
 		"https://app.example.com:8443/oauth/client",
 		"https://app.example.com:443/oauth/client",
-		"https://app.example.com/",
 	}
 	for _, in := range valid {
 		u, err := url.Parse(in)
@@ -51,6 +49,7 @@ func TestValidateCIMDURL(t *testing.T) {
 		"https://app.example.com/oauth?foo=bar",
 		"http://app.example.com/oauth/client",
 		"https://app.example.com",
+		"https://app.example.com/",
 		"https://app.example.com/a/../b",
 		"https://app.example.com/./a",
 		"https://app.example.com/oauth#frag",
@@ -82,7 +81,24 @@ func TestClientMetadataDocument_Validate(t *testing.T) {
 	t.Run("client_id mismatch is rejected", func(t *testing.T) {
 		doc := valid()
 		doc.ClientID = "https://evil.example.com/c"
-		require.Error(t, doc.Validate(id))
+		require.ErrorIs(t, doc.Validate(id), ErrCIMDClientIDMismatch)
+	})
+
+	// An error page served as JSON has no client_id, and must not count as the client giving up its URL
+	t.Run("missing client_id is malformed and not a mismatch", func(t *testing.T) {
+		doc := valid()
+		doc.ClientID = ""
+		err := doc.Validate(id)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrCIMDClientIDMismatch)
+	})
+
+	t.Run("explicitly empty grant_types and response_types are rejected", func(t *testing.T) {
+		for _, list := range []string{"grant_types", "response_types"} {
+			var doc ClientMetadataDocument
+			require.NoError(t, json.Unmarshal([]byte(`{"client_id":"`+id+`","redirect_uris":["https://app.example.com/callback"],"`+list+`":[]}`), &doc))
+			require.ErrorContains(t, doc.Validate(id), "empty", list)
+		}
 	})
 
 	t.Run("client secret is rejected", func(t *testing.T) {
@@ -102,13 +118,18 @@ func TestClientMetadataDocument_Validate(t *testing.T) {
 			doc := valid()
 			doc.TokenEndpointAuthMethod = method
 			require.Error(t, doc.Validate(id))
+
+			listed := valid()
+			listed.TokenEndpointAuthMethodsSupported = []string{"none", method}
+			require.Error(t, listed.Validate(id))
 		}
 	})
 
-	t.Run("omitted authentication method is rejected", func(t *testing.T) {
+	t.Run("omitted authentication method is not the RFC 7591 default", func(t *testing.T) {
 		doc := valid()
 		doc.TokenEndpointAuthMethod = ""
-		require.ErrorContains(t, doc.Validate(id), "client_secret_basic")
+		require.NoError(t, doc.Validate(id))
+		assert.Equal(t, []string{"none"}, doc.TokenEndpointAuthMethods())
 	})
 
 	t.Run("private key material is rejected", func(t *testing.T) {
@@ -121,6 +142,10 @@ func TestClientMetadataDocument_Validate(t *testing.T) {
 		doc := valid()
 		doc.TokenEndpointAuthMethod = "private_key_jwt"
 		require.Error(t, doc.Validate(id))
+
+		listed := valid()
+		listed.TokenEndpointAuthMethodsSupported = []string{"none", "private_key_jwt"}
+		require.Error(t, listed.Validate(id))
 	})
 
 	// Section 4.2 requires registration of redirect URLs for redirect-based grants.
@@ -140,7 +165,6 @@ func TestClientMetadataDocument_Validate(t *testing.T) {
 		doc := valid()
 		doc.RedirectURIs = nil
 		doc.GrantTypes = []string{"client_credentials"}
-		doc.ResponseTypes = []string{}
 		require.NoError(t, doc.Validate(id))
 	})
 
@@ -151,6 +175,19 @@ func TestClientMetadataDocument_Validate(t *testing.T) {
 			require.Errorf(t, doc.Validate(id), "redirect_uri %q", uri)
 		}
 	})
+}
+
+func TestClientMetadataDocument_TokenEndpointAuthMethods(t *testing.T) {
+	listed := &ClientMetadataDocument{TokenEndpointAuthMethod: "private_key_jwt", TokenEndpointAuthMethodsSupported: []string{"none", "private_key_jwt"}}
+	assert.Equal(t, []string{"none", "private_key_jwt"}, listed.TokenEndpointAuthMethods())
+
+	legacy := &ClientMetadataDocument{TokenEndpointAuthMethod: "private_key_jwt"}
+	assert.Equal(t, []string{"private_key_jwt"}, legacy.TokenEndpointAuthMethods())
+
+	// A list that is present but empty declares no method, so the legacy field must not fill in for it
+	var empty ClientMetadataDocument
+	require.NoError(t, json.Unmarshal([]byte(`{"token_endpoint_auth_method":"none","token_endpoint_auth_methods_supported":[]}`), &empty))
+	assert.Empty(t, empty.TokenEndpointAuthMethods())
 }
 
 func TestClientMetadataDocument_UnmarshalJSON(t *testing.T) {
@@ -198,6 +235,39 @@ func TestNewCIMDClient(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"authorization_code"}, defaulted.GrantTypes)
 	assert.Equal(t, []string{"code"}, defaulted.ResponseTypes)
+
+	t.Run("a declared private_key_jwt is required over none", func(t *testing.T) {
+		client, err := NewCIMDClient(&ClientMetadataDocument{
+			ClientID:                          id,
+			RedirectURIs:                      []string{"https://app.example.com/callback"},
+			TokenEndpointAuthMethodsSupported: []string{"none", "private_key_jwt"},
+			JWKSURI:                           "https://app.example.com/jwks.json",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "private_key_jwt", client.GetTokenEndpointAuthMethod())
+		assert.False(t, client.IsPublic())
+	})
+
+	t.Run("unsupported methods next to none are ignored", func(t *testing.T) {
+		client, err := NewCIMDClient(&ClientMetadataDocument{
+			ClientID:                          id,
+			RedirectURIs:                      []string{"https://app.example.com/callback"},
+			TokenEndpointAuthMethod:           "tls_client_auth",
+			TokenEndpointAuthMethodsSupported: []string{"tls_client_auth", "none"},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "none", client.GetTokenEndpointAuthMethod())
+		assert.True(t, client.IsPublic())
+	})
+
+	t.Run("a document without a supported method is rejected", func(t *testing.T) {
+		_, err := NewCIMDClient(&ClientMetadataDocument{
+			ClientID:                id,
+			RedirectURIs:            []string{"https://app.example.com/callback"},
+			TokenEndpointAuthMethod: "tls_client_auth",
+		})
+		require.Error(t, err)
+	})
 }
 
 func TestCIMDClient_FetchCIMDReferencedURL(t *testing.T) {
@@ -303,19 +373,17 @@ func TestCIMDResolver_MaxConcurrentDiscoveries(t *testing.T) {
 		MaxConcurrentDiscoveries: 1,
 	}
 
-	release, err := r.acquire(t.Context())
+	release, err := r.acquire()
 	require.NoError(t, err)
 
-	// With the only slot held, a second acquisition must wait rather than proceed.
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	_, err = r.acquire(ctx)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+	// With the only slot held, a second discovery is turned away instead of queued behind it
+	_, err = r.acquire()
+	require.ErrorIs(t, err, ErrCIMDTemporarilyUnavailable)
 
 	release()
 
 	// Once released the slot is reusable.
-	release2, err := r.acquire(t.Context())
+	release2, err := r.acquire()
 	require.NoError(t, err)
 	release2()
 }
