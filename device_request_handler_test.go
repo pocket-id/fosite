@@ -267,3 +267,51 @@ func TestNewDeviceRequestIgnoresUnknownScopes(t *testing.T) {
 	// The unknown "foo" scope is dropped instead of failing the request.
 	assert.Equal(t, Arguments{"17", "42"}, ar.GetRequestedScopes())
 }
+
+func TestNewDeviceRequestMultipleResources(t *testing.T) {
+	for _, tc := range []struct {
+		description   string
+		allowMultiple bool
+		resources     []string
+		expectErr     error
+	}{
+		{description: "a single resource is accepted by default", resources: []string{"https://api.example.com"}},
+		{description: "repeated resources are rejected by default", resources: []string{"https://api.example.com", "https://other.example.com"}, expectErr: ErrInvalidTarget},
+		{description: "repeated resources are accepted when allowed", allowMultiple: true, resources: []string{"https://api.example.com", "https://other.example.com"}},
+		{description: "every repeated resource is validated", allowMultiple: true, resources: []string{"https://api.example.com", "https://other.example.com#fragment"}, expectErr: ErrInvalidTarget},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			store := internal.NewMockStorage(ctrl)
+			clientManager := internal.NewMockClientManager(ctrl)
+			defer ctrl.Finish()
+
+			deviceClient := &DefaultClient{ID: "client_id"}
+			deviceClient.Public = true
+			deviceClient.GrantTypes = []string{"urn:ietf:params:oauth:grant-type:device_code"}
+
+			config := &Config{ScopeStrategy: ExactScopeStrategy, AudienceMatchingStrategy: DefaultAudienceMatchingStrategy, AllowMultipleResourceIndicators: tc.allowMultiple}
+			fosite := &Fosite{Store: store, Config: config}
+
+			if tc.expectErr == nil {
+				store.EXPECT().FositeClientManager().Return(clientManager).Times(1)
+				clientManager.EXPECT().GetClient(gomock.Any(), gomock.Eq("client_id")).Return(deviceClient, nil)
+			}
+
+			form := url.Values{
+				"client_id": {"client_id"},
+				"resource":  tc.resources,
+			}
+			r := &http.Request{PostForm: form, Form: form, Method: "POST"}
+
+			ar, err := fosite.NewDeviceRequest(context.Background(), r)
+			if tc.expectErr != nil {
+				require.Error(t, err)
+				assert.True(t, errors.Is(err, tc.expectErr))
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.resources, GetResourceIndicators(ar.GetRequestForm()))
+		})
+	}
+}

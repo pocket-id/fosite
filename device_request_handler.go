@@ -35,7 +35,7 @@ func (f *Fosite) NewDeviceRequest(ctx context.Context, r *http.Request) (_ Devic
 		return request, errorsx.WithStack(ErrInvalidRequest.WithHint("The POST body can not be empty."))
 	}
 	request.Form = r.PostForm
-	if _, err := ValidateResourceIndicator(request.GetRequestForm()); err != nil {
+	if _, err := ValidateResourceIndicators(request.GetRequestForm(), f.Config.GetAllowMultipleResourceIndicators(ctx)); err != nil {
 		return request, err
 	}
 

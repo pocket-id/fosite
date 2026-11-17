@@ -5,6 +5,7 @@ package fosite
 
 import (
 	"net/url"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -37,6 +38,37 @@ func ValidateResourceIndicator(form url.Values) (string, error) {
 	}
 
 	return resource, nil
+}
+
+// GetResourceIndicators returns every RFC 8707 resource value of a form in request order, or nil if there is none.
+// Unlike GetResourceIndicator it never fails, and it does not validate the values.
+func GetResourceIndicators(form url.Values) []string {
+	return slices.Clone(form["resource"])
+}
+
+// ValidateResourceIndicators validates and returns the RFC 8707 resource values of a form.
+//
+// RFC 8707 Section 2 allows a client to repeat the "resource" parameter, but lets the authorization server refuse
+// to fulfil a request with several of them. With allowMultiple false this behaves exactly like
+// ValidateResourceIndicator: repeated values are rejected with invalid_target. With allowMultiple true every
+// value must be an absolute URI without a fragment, and all of them are returned in request order. Duplicates are
+// not removed: deciding whether two spellings name the same resource is up to the caller.
+func ValidateResourceIndicators(form url.Values, allowMultiple bool) ([]string, error) {
+	if len(form["resource"]) <= 1 || !allowMultiple {
+		resource, err := ValidateResourceIndicator(form)
+		if err != nil || resource == "" {
+			return nil, err
+		}
+		return []string{resource}, nil
+	}
+
+	for _, resource := range form["resource"] {
+		if !IsValidResourceIndicatorURI(resource) {
+			return nil, errorsx.WithStack(ErrInvalidTarget.WithHintf("The requested resource '%s' is invalid, missing, unknown, or malformed.", resource))
+		}
+	}
+
+	return GetResourceIndicators(form), nil
 }
 
 // IsValidResourceIndicatorURI reports whether raw is an absolute RFC 8707 resource URI without a fragment component.

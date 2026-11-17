@@ -78,6 +78,15 @@ type IgnoreUnknownScopesProvider interface {
 	GetIgnoreUnknownScopes(ctx context.Context) bool
 }
 
+// AllowMultipleResourceIndicatorsProvider returns the provider for configuring whether the RFC 8707 "resource"
+// parameter may be repeated.
+type AllowMultipleResourceIndicatorsProvider interface {
+	// GetAllowMultipleResourceIndicators returns true if authorization, token and device authorization requests may
+	// carry more than one "resource" parameter (RFC 8707 Section 2). When false, such requests are rejected with
+	// invalid_target.
+	GetAllowMultipleResourceIndicators(ctx context.Context) bool
+}
+
 // SupportedRequestObjectSigningAlgorithmsProvider returns the provider for configuring the JWS algorithms
 // accepted for OpenID Connect request objects.
 type SupportedRequestObjectSigningAlgorithmsProvider interface {

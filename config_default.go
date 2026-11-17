@@ -33,6 +33,7 @@ var (
 	_ ScopeStrategyProvider                           = (*Config)(nil)
 	_ AudienceStrategyProvider                        = (*Config)(nil)
 	_ IgnoreUnknownScopesProvider                     = (*Config)(nil)
+	_ AllowMultipleResourceIndicatorsProvider         = (*Config)(nil)
 	_ SupportedRequestObjectSigningAlgorithmsProvider = (*Config)(nil)
 	_ RedirectSecureCheckerProvider                   = (*Config)(nil)
 	_ RedirectURIMatcherProvider                      = (*Config)(nil)
@@ -130,6 +131,14 @@ type Config struct {
 	// client requesting a scope it was never granted is an error (RFC 6749 Section 5.2), and scopes that were
 	// granted but have since been removed from the client still invalidate the refresh flow. Defaults to false.
 	IgnoreUnknownScopes bool
+
+	// AllowMultipleResourceIndicators, if set to true, lets authorization, token and device authorization requests
+	// repeat the RFC 8707 "resource" parameter (Section 2). Every value is validated, but fosite attaches no further
+	// meaning to them: matching them against the resources a client may use, narrowing them on a token request
+	// (Section 2.2) and deriving the token audience is left to the application, which reads the values with
+	// GetResourceIndicators. Requester.GetResource stays single-valued and returns invalid_target when a request
+	// carries more than one. Defaults to false, which rejects repeated "resource" parameters with invalid_target.
+	AllowMultipleResourceIndicators bool
 
 	// SupportedRequestObjectSigningAlgorithms sets the JWS "alg" values accepted for OpenID Connect request
 	// objects (the "request" and "request_uri" authorization request parameters), mirroring the
@@ -421,6 +430,12 @@ func (c *Config) GetScopeStrategy(_ context.Context) ScopeStrategy {
 		c.ScopeStrategy = WildcardScopeStrategy
 	}
 	return c.ScopeStrategy
+}
+
+// GetAllowMultipleResourceIndicators returns true if requests may repeat the RFC 8707 "resource" parameter.
+// Defaults to false.
+func (c *Config) GetAllowMultipleResourceIndicators(_ context.Context) bool {
+	return c.AllowMultipleResourceIndicators
 }
 
 // GetIgnoreUnknownScopes returns true if requested scopes that are not covered by the client's registered scopes
