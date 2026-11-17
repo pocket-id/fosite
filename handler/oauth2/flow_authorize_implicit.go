@@ -67,7 +67,7 @@ func (c *AuthorizeImplicitGrantHandler) IssueImplicitAccessToken(ctx context.Con
 	// Only override expiry if none is set.
 	atLifespan := fosite.GetEffectiveLifespan(ar.GetClient(), fosite.GrantTypeImplicit, fosite.AccessToken, c.Config.GetAccessTokenLifespan(ctx))
 	if ar.GetSession().GetExpiresAt(fosite.AccessToken).IsZero() {
-		ar.GetSession().SetExpiresAt(fosite.AccessToken, time.Now().UTC().Add(atLifespan).Round(time.Second))
+		ar.GetSession().SetExpiresAt(fosite.AccessToken, AccessTokenExpiresAt(atLifespan))
 	}
 
 	// Generate the access token

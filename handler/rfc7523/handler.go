@@ -136,7 +136,7 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 	}
 
 	atLifespan := fosite.GetEffectiveLifespan(request.GetClient(), fosite.GrantTypeJWTBearer, fosite.AccessToken, c.Config.GetAccessTokenLifespan(ctx))
-	session.SetExpiresAt(fosite.AccessToken, time.Now().UTC().Add(atLifespan).Round(time.Second))
+	session.SetExpiresAt(fosite.AccessToken, oauth2.AccessTokenExpiresAt(atLifespan))
 	session.SetSubject(claims.Subject)
 
 	return nil
