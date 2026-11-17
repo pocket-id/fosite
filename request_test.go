@@ -5,6 +5,7 @@
 package fosite_test
 
 import (
+	"errors"
 	"net/url"
 	"testing"
 	"time"
@@ -42,6 +43,12 @@ func TestRequestGetResource(t *testing.T) {
 	resource, err := request.GetResource()
 	require.NoError(t, err)
 	assert.Equal(t, "https://api.example.com", resource)
+
+	// GetResource stays single-valued even for applications that allow repeated resources.
+	request.Form = url.Values{"resource": {"https://api.example.com", "https://other.example.com"}}
+	_, err = request.GetResource()
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrInvalidTarget))
 
 	request.Form = url.Values{"audience": {"https://api.example.com"}}
 	resource, err = request.GetResource()

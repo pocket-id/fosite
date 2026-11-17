@@ -59,6 +59,71 @@ func TestValidateResourceIndicator(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrInvalidTarget))
 }
 
+func TestGetResourceIndicators(t *testing.T) {
+	assert.Empty(t, GetResourceIndicators(url.Values{}))
+	assert.Empty(t, GetResourceIndicators(url.Values{"audience": {"https://api.example.com"}}))
+
+	assert.Equal(t, []string{"https://api.example.com"}, GetResourceIndicators(url.Values{"resource": {"https://api.example.com"}}))
+	assert.Equal(t,
+		[]string{"https://api.example.com", "https://other.example.com"},
+		GetResourceIndicators(url.Values{"resource": {"https://api.example.com", "https://other.example.com"}}),
+	)
+
+	// The result is a copy: changing it must not change the request form.
+	form := url.Values{"resource": {"https://api.example.com"}}
+	GetResourceIndicators(form)[0] = "https://changed.example.com"
+	assert.Equal(t, "https://api.example.com", form.Get("resource"))
+}
+
+func TestValidateResourceIndicators(t *testing.T) {
+	const a, b = "https://api.example.com", "https://other.example.com"
+
+	for _, allowMultiple := range []bool{false, true} {
+		// Zero and one value behave the same, whatever the option says.
+		resources, err := ValidateResourceIndicators(url.Values{}, allowMultiple)
+		require.NoError(t, err)
+		assert.Empty(t, resources)
+
+		resources, err = ValidateResourceIndicators(url.Values{"resource": {a}}, allowMultiple)
+		require.NoError(t, err)
+		assert.Equal(t, []string{a}, resources)
+
+		_, err = ValidateResourceIndicators(url.Values{"resource": {a + "#fragment"}}, allowMultiple)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, ErrInvalidTarget))
+	}
+
+	t.Run("repeated values are rejected by default", func(t *testing.T) {
+		_, err := ValidateResourceIndicators(url.Values{"resource": {a, b}}, false)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, ErrInvalidTarget))
+	})
+
+	t.Run("repeated values are returned in request order when allowed", func(t *testing.T) {
+		resources, err := ValidateResourceIndicators(url.Values{"resource": {b, a, "urn:example:resource"}}, true)
+		require.NoError(t, err)
+		assert.Equal(t, []string{b, a, "urn:example:resource"}, resources)
+	})
+
+	t.Run("duplicates are kept", func(t *testing.T) {
+		resources, err := ValidateResourceIndicators(url.Values{"resource": {a, a}}, true)
+		require.NoError(t, err)
+		assert.Equal(t, []string{a, a}, resources)
+	})
+
+	t.Run("every value is validated when allowed", func(t *testing.T) {
+		for _, invalid := range []string{"", "/relative", b + "#fragment", b + "/with space"} {
+			_, err := ValidateResourceIndicators(url.Values{"resource": {a, invalid}}, true)
+			require.Error(t, err, invalid)
+			assert.True(t, errors.Is(err, ErrInvalidTarget), invalid)
+
+			_, err = ValidateResourceIndicators(url.Values{"resource": {invalid, a}}, true)
+			require.Error(t, err, invalid)
+			assert.True(t, errors.Is(err, ErrInvalidTarget), invalid)
+		}
+	})
+}
+
 func TestIsValidResourceIndicatorURI(t *testing.T) {
 	for _, raw := range []string{
 		"https://api.example.com",
