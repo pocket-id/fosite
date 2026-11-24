@@ -331,6 +331,10 @@ func (s *MemoryStore) InvalidateAuthorizeCodeSession(_ context.Context, _, signa
 	if !ok {
 		return fosite.ErrNotFound
 	}
+	if !rel.active {
+		// compare-and-set: a second redemption of the same code must lose (see oauth2.AuthorizeCodeStorage)
+		return fosite.ErrInvalidatedAuthorizeCode
+	}
 	rel.active = false
 	s.AuthorizeCodes[signature] = rel
 	return nil
