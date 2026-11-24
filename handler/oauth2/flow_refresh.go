@@ -53,20 +53,12 @@ func (c *RefreshTokenGrantHandler) HandleTokenEndpointRequest(ctx context.Contex
 	refresh := request.GetRequestForm().Get("refresh_token")
 	signature := c.Strategy.RefreshTokenStrategy().RefreshTokenSignature(ctx, refresh)
 	originalRequest, err := c.Storage.RefreshTokenStorage().GetRefreshTokenSession(ctx, signature, request.GetSession())
-	if errors.Is(err, fosite.ErrInactiveToken) {
-		// Detected refresh token reuse
-		if rErr := c.handleRefreshTokenReuse(ctx, signature, originalRequest); rErr != nil {
-			return errorsx.WithStack(rErr)
-		}
-
-		return fosite.ErrInvalidGrant.WithWrap(err).
-			WithHint("The refresh token was already used.").
-			WithDebugf("Refresh token re-use was detected. All related tokens have been revoked.")
-	} else if errors.Is(err, fosite.ErrNotFound) {
+	reused := errors.Is(err, fosite.ErrInactiveToken)
+	if errors.Is(err, fosite.ErrNotFound) {
 		return fosite.ErrInvalidGrant.WithWrap(err).
 			WithHint("The refresh token is malformed or not valid.").
 			WithDebug("The refresh token can not be found.")
-	} else if err != nil {
+	} else if err != nil && !reused {
 		return fosite.ErrServerError.WithWrap(err).WithDebug(err.Error())
 	}
 
@@ -83,6 +75,18 @@ func (c *RefreshTokenGrantHandler) HandleTokenEndpointRequest(ctx context.Contex
 	// The authorization server MUST ... and ensure that the refresh token was issued to the authenticated client
 	if originalRequest.GetClient().GetID() != request.GetClient().GetID() {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The OAuth 2.0 Client ID from this request does not match the ID during the initial token issuance."))
+	}
+
+	// A refresh token that is used twice ends the grant it belongs to
+	// The checks above come first, so this takes the genuine token and the client it was issued to
+	if reused {
+		if rErr := c.handleRefreshTokenReuse(ctx, signature, originalRequest); rErr != nil {
+			return errorsx.WithStack(rErr)
+		}
+
+		return fosite.ErrInvalidGrant.WithWrap(err).
+			WithHint("The refresh token was already used.").
+			WithDebugf("Refresh token re-use was detected. All related tokens have been revoked.")
 	}
 
 	request.SetID(originalRequest.GetID())

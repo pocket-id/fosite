@@ -29,9 +29,32 @@ type deviceTokenStorage interface {
 
 // usedDeviceCodeStore reports every device code as already used, like a
 // storage backend that keeps invalidated device code sessions.
+// It also notes how the tokens of a grant are revoked.
 type usedDeviceCodeStore struct {
 	*storage.MemoryStore
-	used fosite.DeviceRequester
+	used  fosite.DeviceRequester
+	calls []string
+}
+
+func (s *usedDeviceCodeStore) TokenRevocationStorage() oauth2.TokenRevocationStorage {
+	return s
+}
+
+func (s *usedDeviceCodeStore) Transaction(ctx context.Context, f func(ctx context.Context) error) error {
+	s.calls = append(s.calls, "begin")
+	err := f(ctx)
+	s.calls = append(s.calls, "end")
+	return err
+}
+
+func (s *usedDeviceCodeStore) RevokeRefreshToken(ctx context.Context, requestID string) error {
+	s.calls = append(s.calls, "refresh")
+	return s.MemoryStore.RevokeRefreshToken(ctx, requestID)
+}
+
+func (s *usedDeviceCodeStore) RevokeAccessToken(ctx context.Context, requestID string) error {
+	s.calls = append(s.calls, "access")
+	return s.MemoryStore.RevokeAccessToken(ctx, requestID)
 }
 
 func (s *usedDeviceCodeStore) DeviceAuthStorage() rfc8628.DeviceAuthStorage {
@@ -57,6 +80,7 @@ func TestDeviceCodeReuseRevokesTokensOfOriginalGrant(t *testing.T) {
 		},
 	}
 	memoryStore := storage.NewMemoryStore()
+	store := &usedDeviceCodeStore{MemoryStore: memoryStore, used: original}
 	require.NoError(t, memoryStore.CreateAccessTokenSession(ctx, "original-access-token", original))
 	require.NoError(t, memoryStore.CreateRefreshTokenSession(ctx, "original-refresh-token", "original-access-token", original))
 
@@ -67,7 +91,7 @@ func TestDeviceCodeReuseRevokesTokensOfOriginalGrant(t *testing.T) {
 			userCodeStrategy:        &RFC8628HMACSHAStrategy,
 			coreStrategy:            hmacshaStrategyOAuth,
 		},
-		Storage: &usedDeviceCodeStore{MemoryStore: memoryStore, used: original},
+		Storage: store,
 		Config: &fosite.Config{
 			ScopeStrategy:             fosite.HierarchicScopeStrategy,
 			AudienceMatchingStrategy:  fosite.DefaultAudienceMatchingStrategy,
@@ -78,14 +102,24 @@ func TestDeviceCodeReuseRevokesTokensOfOriginalGrant(t *testing.T) {
 	// The replayed device code arrives with a new request ID
 	code, _, err := RFC8628HMACSHAStrategy.GenerateDeviceCode(ctx)
 	require.NoError(t, err)
-	replay := fosite.NewAccessRequest(&fosite.DefaultSession{})
-	replay.GrantTypes = fosite.Arguments{string(fosite.GrantTypeDeviceCode)}
-	replay.Client = client
-	replay.Form = url.Values{"device_code": {code}}
-	require.NotEqual(t, original.GetID(), replay.GetID())
+	replay := func(client fosite.Client) error {
+		request := fosite.NewAccessRequest(&fosite.DefaultSession{})
+		request.GrantTypes = fosite.Arguments{string(fosite.GrantTypeDeviceCode)}
+		request.Client = client
+		request.Form = url.Values{"device_code": {code}}
+		require.NotEqual(t, original.GetID(), request.GetID())
+		return h.HandleTokenEndpointRequest(ctx, request)
+	}
 
-	err = h.HandleTokenEndpointRequest(ctx, replay)
+	// Another client is refused without ending the grant
+	err = replay(&fosite.DefaultClient{ID: "bar", GrantTypes: fosite.Arguments{string(fosite.GrantTypeDeviceCode)}})
 	require.ErrorIs(t, err, fosite.ErrInvalidGrant)
+	require.Empty(t, store.calls)
+
+	// The client the device code was issued to ends the grant, refresh token first and in one transaction
+	err = replay(client)
+	require.ErrorIs(t, err, fosite.ErrInvalidGrant)
+	require.Equal(t, []string{"begin", "refresh", "access", "end"}, store.calls)
 
 	// Both tokens of the original grant are revoked
 	_, err = memoryStore.GetAccessTokenSession(ctx, "original-access-token", nil)
@@ -105,10 +139,10 @@ func (s *lostRaceDeviceCodeStore) DeviceAuthStorage() rfc8628.DeviceAuthStorage 
 }
 
 func (s *lostRaceDeviceCodeStore) InvalidateDeviceCodeSession(context.Context, string) error {
-	return fosite.ErrInvalidGrant.WithHint("The device code has already been used.")
+	return fosite.ErrInvalidatedDeviceCode
 }
 
-func TestDeviceCodeLostRedemptionRaceReturnsInvalidGrant(t *testing.T) {
+func TestDeviceCodeLostRedemptionRaceRevokesGrant(t *testing.T) {
 	ctx := context.Background()
 	client := &fosite.DefaultClient{ID: "foo", GrantTypes: fosite.Arguments{string(fosite.GrantTypeDeviceCode)}}
 	accepted := &fosite.DeviceRequest{
@@ -141,6 +175,10 @@ func TestDeviceCodeLostRedemptionRaceReturnsInvalidGrant(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, memoryStore.CreateDeviceAuthSession(ctx, signature, userCodeSignature, accepted))
 
+			// The winner's tokens belong to the same grant
+			require.NoError(t, memoryStore.CreateAccessTokenSession(ctx, "winner-access-token", accepted))
+			require.NoError(t, memoryStore.CreateRefreshTokenSession(ctx, "winner-refresh-token", "winner-access-token", accepted))
+
 			h := rfc8628.DeviceCodeTokenEndpointHandler{
 				Strategy: &mockDeviceCodeStrategyProvider{
 					deviceRateLimitStrategy: &RFC8628HMACSHAStrategy,
@@ -156,7 +194,9 @@ func TestDeviceCodeLostRedemptionRaceReturnsInvalidGrant(t *testing.T) {
 				},
 			}
 
+			// This request passed HandleTokenEndpointRequest, which gave it the ID of the grant
 			request := fosite.NewAccessRequest(&fosite.DefaultSession{})
+			request.ID = accepted.ID
 			request.GrantTypes = fosite.Arguments{string(fosite.GrantTypeDeviceCode)}
 			request.Client = client
 			request.Form = url.Values{"device_code": {code}}
@@ -164,6 +204,10 @@ func TestDeviceCodeLostRedemptionRaceReturnsInvalidGrant(t *testing.T) {
 			err = h.PopulateTokenEndpointResponse(ctx, request, fosite.NewAccessResponse())
 			require.ErrorIs(t, err, fosite.ErrInvalidGrant)
 			require.Equal(t, http.StatusBadRequest, fosite.ErrorToRFC6749Error(err).CodeField)
+			_, err = memoryStore.GetAccessTokenSession(ctx, "winner-access-token", nil)
+			require.ErrorIs(t, err, fosite.ErrNotFound)
+			_, err = memoryStore.GetRefreshTokenSession(ctx, "winner-refresh-token", nil)
+			require.ErrorIs(t, err, fosite.ErrInactiveToken)
 		})
 	}
 }

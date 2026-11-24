@@ -6,8 +6,6 @@ package rfc8628
 
 import (
 	"context"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -69,10 +67,9 @@ func (c *DeviceCodeTokenEndpointHandler) PopulateTokenEndpointResponse(ctx conte
 
 	ar, err := c.session(ctx, requester, signature)
 	if err != nil {
-		// A concurrent request redeemed the device code after this request
-		// passed HandleTokenEndpointRequest.
+		// Another request redeemed the device code after this one passed HandleTokenEndpointRequest, which is a second use like any other
 		if errors.Is(err, fosite.ErrInvalidatedDeviceCode) {
-			return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The device code has already been used.").WithWrap(err).WithDebug(err.Error()))
+			return c.revokeTokens(ctx, requester.GetID())
 		}
 		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 	}
@@ -117,6 +114,12 @@ func (c *DeviceCodeTokenEndpointHandler) PopulateTokenEndpointResponse(ctx conte
 		return nil
 	})
 	if err != nil {
+		// The storage reports a device code that another request redeemed in the meantime, which is a second use like any other
+		// The tokens are revoked here, after the transaction of this request was rolled back
+		if errors.Is(err, fosite.ErrInvalidatedDeviceCode) {
+			return c.revokeTokens(ctx, requester.GetID())
+		}
+
 		// A storage call inside the transaction may return a deliberate
 		// client-facing grant error (e.g. invalid_grant when a device code was
 		// already used). Preserve its status instead of masking it as a
@@ -159,14 +162,9 @@ func (c *DeviceCodeTokenEndpointHandler) HandleTokenEndpointRequest(ctx context.
 		return errorsx.WithStack(err)
 	}
 
-	var ar fosite.DeviceRequester
-	if ar, err = c.session(ctx, requester, signature); err != nil {
-		if ar != nil && (errors.Is(err, fosite.ErrInvalidatedAuthorizeCode) || errors.Is(err, fosite.ErrInvalidatedDeviceCode)) {
-			// Revoke the tokens of the grant the reused device code was issued
-			// for. This request's own ID was generated for it and has no tokens.
-			return c.revokeTokens(ctx, ar.GetID())
-		}
-
+	ar, err := c.session(ctx, requester, signature)
+	reused := ar != nil && errors.Is(err, fosite.ErrInvalidatedDeviceCode)
+	if err != nil && !reused {
 		return err
 	}
 
@@ -185,6 +183,12 @@ func (c *DeviceCodeTokenEndpointHandler) HandleTokenEndpointRequest(ctx context.
 	// or if the client is public, ensure that the code was issued to "client_id" in the request
 	if ar.GetClient().GetID() != requester.GetClient().GetID() {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The OAuth 2.0 Client ID from this request does not match the one from the authorize request."))
+	}
+
+	// A device code that is used twice ends the grant it was issued for, whose ID is the stored request's and not the one of this request
+	// The checks above come first, so this takes the genuine code and the client it was issued to
+	if reused {
+		return c.revokeTokens(ctx, ar.GetID())
 	}
 
 	// Checking of POST client_id skipped, because
@@ -220,21 +224,23 @@ func (c *DeviceCodeTokenEndpointHandler) canIssueRefreshToken(ctx context.Contex
 	return true
 }
 
+// revokeTokens revokes the tokens of the grant whose device code was used twice, and returns the error that answers the request
+// The refresh token goes first and both go in one transaction, so a refresh that runs at the same time can't leave a token behind
 func (c *DeviceCodeTokenEndpointHandler) revokeTokens(ctx context.Context, reqId string) error {
-	hint := "The device code has already been used."
-	var debug strings.Builder
-
-	revokeAndAppendErr := func(tokenType string, revokeFunc func(context.Context, string) error) {
-		if err := revokeFunc(ctx, reqId); err != nil {
-			hint += fmt.Sprintf(" Additionally, an error occurred during processing the %s token revocation.", tokenType)
-			debug.WriteString(fmt.Sprintf("Revocation of %s token lead to error %s.", tokenType, err.Error()))
+	invalid := fosite.ErrInvalidGrant.WithHint("The device code has already been used.")
+	err := c.Storage.Transaction(ctx, func(ctx context.Context) error {
+		if err := c.Storage.TokenRevocationStorage().RevokeRefreshToken(ctx, reqId); err != nil && !errors.Is(err, fosite.ErrNotFound) {
+			return err
 		}
+		if err := c.Storage.TokenRevocationStorage().RevokeAccessToken(ctx, reqId); err != nil && !errors.Is(err, fosite.ErrNotFound) {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		invalid = invalid.WithHint("The device code has already been used. Additionally, an error occurred during the revocation of its tokens.").WithDebug(err.Error())
 	}
-
-	revokeAndAppendErr("access", c.Storage.TokenRevocationStorage().RevokeAccessToken)
-	revokeAndAppendErr("refresh", c.Storage.TokenRevocationStorage().RevokeRefreshToken)
-
-	return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint(hint).WithDebug(debug.String()))
+	return errorsx.WithStack(invalid)
 }
 
 func (c DeviceCodeTokenEndpointHandler) deviceCode(ctx context.Context, requester fosite.AccessRequester) (code string, signature string, err error) {

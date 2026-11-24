@@ -347,6 +347,7 @@ func TestAuthorizeCode_HandleTokenEndpointRequest(t *testing.T) {
 						Request: fosite.Request{
 							Client:         &fosite.DefaultClient{ID: "bar"},
 							RequestedScope: fosite.Arguments{"a", "b"},
+							Session:        &fosite.DefaultSession{},
 						},
 					},
 					description: "should fail because client mismatch",

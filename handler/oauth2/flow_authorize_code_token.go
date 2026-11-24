@@ -28,35 +28,20 @@ func (c *AuthorizeExplicitGrantHandler) HandleTokenEndpointRequest(ctx context.C
 	code := request.GetRequestForm().Get("code")
 	signature := c.Strategy.AuthorizeCodeStrategy().AuthorizeCodeSignature(ctx, code)
 	authorizeRequest, err := c.Storage.AuthorizeCodeStorage().GetAuthorizeCodeSession(ctx, code, signature, request.GetSession())
-	if errors.Is(err, fosite.ErrInvalidatedAuthorizeCode) {
-		if authorizeRequest == nil {
-			return fosite.ErrServerError.
-				WithHint("Misconfigured code lead to an error that prohibited the OAuth 2.0 Framework from processing this request.").
-				WithDebug("GetAuthorizeCodeSession must return a value for \"fosite.Requester\" when returning \"ErrInvalidatedAuthorizeCode\".")
-		}
-
-		// If an authorize code is used twice, we revoke all refresh and access tokens associated with this request.
-		reqID := authorizeRequest.GetID()
-		hint := "The authorization code has already been used."
-		debug := ""
-		if revErr := c.Storage.TokenRevocationStorage().RevokeAccessToken(ctx, reqID); revErr != nil {
-			hint += " Additionally, an error occurred during processing the access token revocation."
-			debug += "Revocation of access_token lead to error " + revErr.Error() + "."
-		}
-		if revErr := c.Storage.TokenRevocationStorage().RevokeRefreshToken(ctx, reqID); revErr != nil {
-			hint += " Additionally, an error occurred during processing the refresh token revocation."
-			debug += "Revocation of refresh_token lead to error " + revErr.Error() + "."
-		}
-		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint(hint).WithDebug(debug))
+	reused := errors.Is(err, fosite.ErrInvalidatedAuthorizeCode)
+	if reused && authorizeRequest == nil {
+		return fosite.ErrServerError.
+			WithHint("Misconfigured code lead to an error that prohibited the OAuth 2.0 Framework from processing this request.").
+			WithDebug("GetAuthorizeCodeSession must return a value for \"fosite.Requester\" when returning \"ErrInvalidatedAuthorizeCode\".")
 	} else if err != nil && errors.Is(err, fosite.ErrNotFound) {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.WithWrap(err).WithDebug(err.Error()))
-	} else if err != nil {
+	} else if err != nil && !reused {
 		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 	}
 
 	// The authorization server MUST verify that the authorization code is valid
-	// This needs to happen after store retrieval for the session to be hydrated properly
-	if err := c.Strategy.AuthorizeCodeStrategy().ValidateAuthorizeCode(ctx, request, code); err != nil {
+	// The stored request carries the session the code was issued with, which holds its expiry
+	if err := c.Strategy.AuthorizeCodeStrategy().ValidateAuthorizeCode(ctx, authorizeRequest, code); err != nil {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.WithWrap(err).WithDebug(err.Error()))
 	}
 
@@ -71,6 +56,12 @@ func (c *AuthorizeExplicitGrantHandler) HandleTokenEndpointRequest(ctx context.C
 	// code was issued to "client_id" in the request,
 	if authorizeRequest.GetClient().GetID() != request.GetClient().GetID() {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The OAuth 2.0 Client ID from this request does not match the one from the authorize request."))
+	}
+
+	// A code that is used twice ends the grant it was issued for
+	// The checks above come first, so this takes the genuine code and the client it was issued to
+	if reused {
+		return c.reusedCode(ctx, authorizeRequest.GetID())
 	}
 
 	// ensure that the "redirect_uri" parameter is present if the
@@ -101,6 +92,25 @@ func (c *AuthorizeExplicitGrantHandler) HandleTokenEndpointRequest(ctx context.C
 	return nil
 }
 
+// reusedCode revokes the tokens of the grant whose code was used twice, and returns the error that answers the request
+// The refresh token goes first and both go in one transaction, so a refresh that runs at the same time can't leave a token behind
+func (c *AuthorizeExplicitGrantHandler) reusedCode(ctx context.Context, requestID string) error {
+	invalid := fosite.ErrInvalidGrant.WithHint("The authorization code has already been used.")
+	err := c.Storage.Transaction(ctx, func(ctx context.Context) error {
+		if err := c.Storage.TokenRevocationStorage().RevokeRefreshToken(ctx, requestID); err != nil && !errors.Is(err, fosite.ErrNotFound) {
+			return err
+		}
+		if err := c.Storage.TokenRevocationStorage().RevokeAccessToken(ctx, requestID); err != nil && !errors.Is(err, fosite.ErrNotFound) {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		invalid = invalid.WithHint("The authorization code has already been used. Additionally, an error occurred during the revocation of its tokens.").WithDebug(err.Error())
+	}
+	return errorsx.WithStack(invalid)
+}
+
 func canIssueRefreshToken(ctx context.Context, c *AuthorizeExplicitGrantHandler, request fosite.Requester) bool {
 	scope := c.Config.GetRefreshTokenScopes(ctx)
 	// Require one of the refresh token scopes, if set.
@@ -123,8 +133,9 @@ func (c *AuthorizeExplicitGrantHandler) PopulateTokenEndpointResponse(ctx contex
 	signature := c.Strategy.AuthorizeCodeStrategy().AuthorizeCodeSignature(ctx, code)
 	authorizeRequest, err := c.Storage.AuthorizeCodeStorage().GetAuthorizeCodeSession(ctx, code, signature, requester.GetSession())
 	if err != nil {
+		// Another request redeemed the code after this one passed HandleTokenEndpointRequest, which is a second use like any other
 		if errors.Is(err, fosite.ErrInvalidatedAuthorizeCode) {
-			return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The authorization code has already been used.").WithWrap(err).WithDebug(err.Error()))
+			return c.reusedCode(ctx, requester.GetID())
 		}
 		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 	} else if err := c.Strategy.AuthorizeCodeStrategy().ValidateAuthorizeCode(ctx, requester, code); err != nil {
@@ -168,6 +179,12 @@ func (c *AuthorizeExplicitGrantHandler) PopulateTokenEndpointResponse(ctx contex
 		return nil
 	})
 	if err != nil {
+		// The storage reports a code that another request redeemed in the meantime, which is a second use like any other
+		// The tokens are revoked here, after the transaction of this request was rolled back
+		if errors.Is(err, fosite.ErrInvalidatedAuthorizeCode) {
+			return c.reusedCode(ctx, requester.GetID())
+		}
+
 		// A storage call inside the transaction may return a deliberate
 		// client-facing grant error (e.g. invalid_grant when a code was
 		// already used). Preserve its status instead of masking it as a

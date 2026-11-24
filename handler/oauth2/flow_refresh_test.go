@@ -370,6 +370,31 @@ func TestRefreshFlow_HandleTokenEndpointRequest(t *testing.T) {
 					},
 					expectErr: fosite.ErrInvalidGrant,
 				},
+				{
+					description: "should not revoke the grant when another client presents a used token",
+					setup: func(config *fosite.Config) {
+						areq.GrantTypes = fosite.Arguments{"refresh_token"}
+						areq.Client = &fosite.DefaultClient{ID: "bar", GrantTypes: fosite.Arguments{"refresh_token"}}
+
+						token, sig, err := strategy.GenerateRefreshToken(context.Background(), nil)
+						require.NoError(t, err)
+						areq.Form.Add("refresh_token", token)
+
+						req := &fosite.Request{
+							ID:      "grant-of-foo",
+							Client:  &fosite.DefaultClient{ID: "foo", GrantTypes: fosite.Arguments{"refresh_token"}},
+							Session: sess,
+						}
+						require.NoError(t, store.CreateAccessTokenSession(context.Background(), "access-token-of-foo", req))
+						require.NoError(t, store.CreateRefreshTokenSession(context.Background(), sig, "access-token-of-foo", req))
+						require.NoError(t, store.RevokeRefreshToken(context.Background(), req.ID))
+					},
+					expectErr: fosite.ErrInvalidGrant,
+					expect: func(t *testing.T) {
+						_, err := store.GetAccessTokenSession(context.Background(), "access-token-of-foo", nil)
+						require.NoError(t, err)
+					},
+				},
 			} {
 				t.Run("case="+c.description, func(t *testing.T) {
 					config := &fosite.Config{
@@ -426,6 +451,9 @@ func TestRefreshFlowTransactional_HandleTokenEndpointRequest(t *testing.T) {
 		{
 			description: "should revoke session on token reuse",
 			setup: func() {
+				token, _, err := hmacshaStrategy.GenerateRefreshToken(propagatedContext, nil)
+				require.NoError(t, err)
+				request.Form = url.Values{"refresh_token": {token}}
 				request.GrantTypes = fosite.Arguments{"refresh_token"}
 				request.Client = &fosite.DefaultClient{
 					ID:         "foo",
