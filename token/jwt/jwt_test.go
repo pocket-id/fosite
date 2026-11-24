@@ -6,6 +6,8 @@ package jwt
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"testing"
@@ -215,6 +217,88 @@ func TestValidateSignatureRejectsJWT(t *testing.T) {
 				assert.Error(t, err)
 				t.Logf("Passed test case %d", k)
 			}
+		})
+	}
+}
+
+func TestDecodeVerifiesSignatureBeforeClaims(t *testing.T) {
+	key := gen.MustRSAKey()
+	strategy := &DefaultSigner{GetPrivateKey: func(_ context.Context) (interface{}, error) { return key, nil }}
+
+	token, _, err := strategy.Generate(context.TODO(), MapClaims{"sub": "alice", "exp": time.Now().Add(time.Hour).Unix()}, header)
+	require.NoError(t, err)
+	parts := strings.Split(token, ".")
+
+	t.Run("genuine signature with replaced claims", func(t *testing.T) {
+		replaced := parts[0] + "." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"mallory","padding":"`+strings.Repeat("a", 1<<16)+`"}`)) + "." + parts[2]
+		decoded, err := strategy.Decode(context.TODO(), replaced)
+
+		var ve *ValidationError
+		require.ErrorAs(t, err, &ve)
+		assert.True(t, ve.Has(ValidationErrorSignatureInvalid))
+		// No token means the claims were never decoded
+		assert.Nil(t, decoded)
+	})
+
+	t.Run("malformed claims with an invalid signature fail the signature check", func(t *testing.T) {
+		// Decoding the claims first would report them as invalid instead
+		malformed := parts[0] + "." + base64.RawURLEncoding.EncodeToString([]byte("not json")) + "." + parts[2]
+		_, err := strategy.Decode(context.TODO(), malformed)
+
+		var ve *ValidationError
+		require.ErrorAs(t, err, &ve)
+		assert.True(t, ve.Has(ValidationErrorSignatureInvalid))
+		assert.False(t, ve.Has(ValidationErrorClaimsInvalid))
+	})
+
+	t.Run("large header within the limit", func(t *testing.T) {
+		large, _, err := strategy.Generate(context.TODO(), MapClaims{"sub": "alice", "exp": time.Now().Add(time.Hour).Unix()}, &Headers{Extra: map[string]interface{}{"x-chain": strings.Repeat("A", 8<<10)}})
+		require.NoError(t, err)
+		decoded, err := strategy.Decode(context.TODO(), large)
+		require.NoError(t, err)
+		assert.Equal(t, "alice", decoded.Claims["sub"])
+	})
+
+	t.Run("oversized header", func(t *testing.T) {
+		oversized := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","x":"`+strings.Repeat("a", maxVerifiedHeaderLength)+`"}`)) + "." + parts[1] + "." + parts[2]
+		_, err := strategy.Decode(context.TODO(), oversized)
+
+		var ve *ValidationError
+		require.ErrorAs(t, err, &ve)
+		assert.True(t, ve.Has(ValidationErrorMalformed))
+	})
+
+	t.Run("expired token still returns its claims", func(t *testing.T) {
+		expired, _, err := strategy.Generate(context.TODO(), MapClaims{"sub": "alice", "exp": time.Now().Add(-time.Hour).Unix()}, header)
+		require.NoError(t, err)
+		decoded, err := strategy.Decode(context.TODO(), expired)
+
+		var ve *ValidationError
+		require.ErrorAs(t, err, &ve)
+		assert.True(t, ve.Has(ValidationErrorExpired))
+		assert.Equal(t, "alice", decoded.Claims["sub"])
+	})
+}
+
+func TestEd25519JSONWebKey(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	jsonWebKey := jose.JSONWebKey{Key: privateKey, Algorithm: string(jose.EdDSA)}
+
+	for name, key := range map[string]interface{}{"pointer": &jsonWebKey, "value": jsonWebKey} {
+		t.Run(name, func(t *testing.T) {
+			strategy := &DefaultSigner{GetPrivateKey: func(_ context.Context) (interface{}, error) { return key, nil }}
+
+			token, sig, err := strategy.Generate(context.TODO(), MapClaims{"sub": "alice", "exp": time.Now().Add(time.Hour).Unix()}, header)
+			require.NoError(t, err)
+
+			decoded, err := strategy.Decode(context.TODO(), token)
+			require.NoError(t, err)
+			assert.Equal(t, "alice", decoded.Claims["sub"])
+
+			validatedSig, err := strategy.Validate(context.TODO(), token)
+			require.NoError(t, err)
+			assert.Equal(t, sig, validatedSig)
 		})
 	}
 }

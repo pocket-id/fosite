@@ -82,47 +82,50 @@ func (j *DefaultSigner) Generate(ctx context.Context, claims MapClaims, header M
 
 // Validate validates a token and returns its signature or an error if the token is not valid.
 func (j *DefaultSigner) Validate(ctx context.Context, token string) (string, error) {
-	key, err := j.GetPrivateKey(ctx)
+	verificationKey, err := j.verificationKey(ctx)
 	if err != nil {
 		return "", err
 	}
-
-	if t, ok := key.(*jose.JSONWebKey); ok {
-		key = t.Key
-	}
-
-	switch t := key.(type) {
-	case *rsa.PrivateKey:
-		return validateToken(token, t.PublicKey)
-	case *ecdsa.PrivateKey:
-		return validateToken(token, t.PublicKey)
-	case jose.OpaqueSigner:
-		return validateToken(token, t.Public().Key)
-	default:
-		return "", errors.New("Unable to validate token. Invalid PrivateKey type")
-	}
+	return validateToken(token, verificationKey)
 }
 
 // Decode will decode a JWT token
 func (j *DefaultSigner) Decode(ctx context.Context, token string) (*Token, error) {
+	verificationKey, err := j.verificationKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return decodeToken(token, verificationKey)
+}
+
+// verificationKey returns the public key that verifies the tokens this signer generates
+func (j *DefaultSigner) verificationKey(ctx context.Context) (interface{}, error) {
 	key, err := j.GetPrivateKey(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	// Generate accepts a JSON Web Key by value too
+	if t, ok := key.(jose.JSONWebKey); ok {
+		key = &t
+	}
 	if t, ok := key.(*jose.JSONWebKey); ok {
+		// The public JSON Web Key covers every key type Generate signs with, including Ed25519
+		if public := t.Public(); public.Valid() {
+			return &public, nil
+		}
 		key = t.Key
 	}
 
 	switch t := key.(type) {
 	case *rsa.PrivateKey:
-		return decodeToken(token, t.PublicKey)
+		return t.PublicKey, nil
 	case *ecdsa.PrivateKey:
-		return decodeToken(token, t.PublicKey)
+		return t.PublicKey, nil
 	case jose.OpaqueSigner:
-		return decodeToken(token, t.Public().Key)
+		return t.Public().Key, nil
 	default:
-		return nil, errors.New("Unable to decode token. Invalid PrivateKey type")
+		return nil, errors.New("Unable to verify token. Invalid PrivateKey type")
 	}
 }
 
@@ -159,7 +162,24 @@ func generateToken(claims MapClaims, header Mapper, signingMethod jose.Signature
 	return
 }
 
+// maxVerifiedHeaderLength bounds the encoded header of a token the signer verifies, with room for a certificate chain in x5c
+const maxVerifiedHeaderLength = 64 << 10
+
 func decodeToken(token string, verificationKey interface{}) (*Token, error) {
+	// ParseWithClaims decodes the claims before it verifies the signature, so a token with a genuine signature and replaced claims of any size would be decoded
+	// The key here does not depend on the claims, so the signature is verified first, which only decodes the header
+	header, _, _ := strings.Cut(token, ".")
+	if len(header) > maxVerifiedHeaderLength {
+		return nil, &ValidationError{Errors: ValidationErrorMalformed, text: "token header is too long"}
+	}
+	signed, err := jose.ParseSignedCompact(token, SupportedSignatureAlgorithms)
+	if err != nil {
+		return nil, &ValidationError{Errors: ValidationErrorMalformed, text: err.Error()}
+	}
+	if _, err := signed.Verify(pointer(verificationKey)); err != nil {
+		return nil, &ValidationError{Errors: ValidationErrorSignatureInvalid, text: err.Error()}
+	}
+
 	keyFunc := func(*Token) (interface{}, error) { return verificationKey, nil }
 	return ParseWithClaims(token, MapClaims{}, keyFunc)
 }
