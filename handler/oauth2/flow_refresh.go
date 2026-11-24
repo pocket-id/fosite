@@ -6,6 +6,7 @@ package oauth2
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strings"
 	"time"
@@ -192,13 +193,16 @@ func (c *RefreshTokenGrantHandler) handleRefreshTokenReuse(ctx context.Context, 
 		if err := c.Storage.RefreshTokenStorage().DeleteRefreshTokenSession(ctx, signature); err != nil {
 			return err
 		}
+		// Both revocations are attempted whatever the first one returns: a storage without real transactions cannot
+		// roll the first one back, so stopping at its error would leave the access token alive.
+		var errs []error
 		if err := c.Storage.TokenRevocationStorage().RevokeRefreshToken(ctx, req.GetID()); err != nil && !errors.Is(err, fosite.ErrNotFound) {
-			return err
+			errs = append(errs, err)
 		}
 		if err := c.Storage.TokenRevocationStorage().RevokeAccessToken(ctx, req.GetID()); err != nil && !errors.Is(err, fosite.ErrNotFound) {
-			return err
+			errs = append(errs, err)
 		}
-		return nil
+		return stderrors.Join(errs...)
 	})
 	return handleRefreshTokenEndpointStorageError(err)
 }

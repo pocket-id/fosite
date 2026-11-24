@@ -5,6 +5,7 @@ package rfc8628_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"testing"
@@ -34,6 +35,8 @@ type usedDeviceCodeStore struct {
 	*storage.MemoryStore
 	used  fosite.DeviceRequester
 	calls []string
+	// refreshRevokeErr, when set, is what revoking a refresh token fails with.
+	refreshRevokeErr error
 }
 
 func (s *usedDeviceCodeStore) TokenRevocationStorage() oauth2.TokenRevocationStorage {
@@ -49,6 +52,9 @@ func (s *usedDeviceCodeStore) Transaction(ctx context.Context, f func(ctx contex
 
 func (s *usedDeviceCodeStore) RevokeRefreshToken(ctx context.Context, requestID string) error {
 	s.calls = append(s.calls, "refresh")
+	if s.refreshRevokeErr != nil {
+		return s.refreshRevokeErr
+	}
 	return s.MemoryStore.RevokeRefreshToken(ctx, requestID)
 }
 
@@ -210,4 +216,51 @@ func TestDeviceCodeLostRedemptionRaceRevokesGrant(t *testing.T) {
 			require.ErrorIs(t, err, fosite.ErrInactiveToken)
 		})
 	}
+}
+
+// Without real transactions nothing rolls back what the reuse handling did before a failure, so both tokens of the
+// grant are revoked even when the first revocation fails.
+func TestDeviceCodeReuseRevokesWhatItCanWhenOneRevocationFails(t *testing.T) {
+	ctx := context.Background()
+	client := &fosite.DefaultClient{ID: "foo", GrantTypes: fosite.Arguments{string(fosite.GrantTypeDeviceCode)}}
+	original := &fosite.DeviceRequest{
+		UserCodeState: fosite.UserCodeAccepted,
+		Request: fosite.Request{
+			ID:          "original-grant",
+			Client:      client,
+			Session:     &fosite.DefaultSession{},
+			RequestedAt: time.Now().UTC(),
+		},
+	}
+	memoryStore := storage.NewMemoryStore()
+	store := &usedDeviceCodeStore{MemoryStore: memoryStore, used: original, refreshRevokeErr: errors.New("storage unavailable")}
+	require.NoError(t, memoryStore.CreateAccessTokenSession(ctx, "original-access-token", original))
+	require.NoError(t, memoryStore.CreateRefreshTokenSession(ctx, "original-refresh-token", "original-access-token", original))
+
+	h := rfc8628.DeviceCodeTokenEndpointHandler{
+		Strategy: &mockDeviceCodeStrategyProvider{
+			deviceRateLimitStrategy: &RFC8628HMACSHAStrategy,
+			deviceCodeStrategy:      &RFC8628HMACSHAStrategy,
+			userCodeStrategy:        &RFC8628HMACSHAStrategy,
+			coreStrategy:            hmacshaStrategyOAuth,
+		},
+		Storage: store,
+		Config: &fosite.Config{
+			ScopeStrategy:             fosite.HierarchicScopeStrategy,
+			AudienceMatchingStrategy:  fosite.DefaultAudienceMatchingStrategy,
+			DeviceAndUserCodeLifespan: time.Minute,
+		},
+	}
+
+	code, _, err := RFC8628HMACSHAStrategy.GenerateDeviceCode(ctx)
+	require.NoError(t, err)
+	request := fosite.NewAccessRequest(&fosite.DefaultSession{})
+	request.GrantTypes = fosite.Arguments{string(fosite.GrantTypeDeviceCode)}
+	request.Client = client
+	request.Form = url.Values{"device_code": {code}}
+
+	require.ErrorIs(t, h.HandleTokenEndpointRequest(ctx, request), fosite.ErrInvalidGrant)
+	require.Equal(t, []string{"begin", "refresh", "access", "end"}, store.calls)
+	_, err = memoryStore.GetAccessTokenSession(ctx, "original-access-token", nil)
+	require.ErrorIs(t, err, fosite.ErrNotFound)
 }

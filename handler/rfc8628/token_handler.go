@@ -6,6 +6,7 @@ package rfc8628
 
 import (
 	"context"
+	stderrors "errors"
 	"time"
 
 	"github.com/pkg/errors"
@@ -228,14 +229,17 @@ func (c *DeviceCodeTokenEndpointHandler) canIssueRefreshToken(ctx context.Contex
 // The refresh token goes first and both go in one transaction, so a refresh that runs at the same time can't leave a token behind
 func (c *DeviceCodeTokenEndpointHandler) revokeTokens(ctx context.Context, reqId string) error {
 	invalid := fosite.ErrInvalidGrant.WithHint("The device code has already been used.")
+	// Both revocations are attempted whatever the first one returns: a storage without real transactions cannot roll the
+	// first one back, so stopping at its error would leave the access token alive.
 	err := c.Storage.Transaction(ctx, func(ctx context.Context) error {
+		var errs []error
 		if err := c.Storage.TokenRevocationStorage().RevokeRefreshToken(ctx, reqId); err != nil && !errors.Is(err, fosite.ErrNotFound) {
-			return err
+			errs = append(errs, err)
 		}
 		if err := c.Storage.TokenRevocationStorage().RevokeAccessToken(ctx, reqId); err != nil && !errors.Is(err, fosite.ErrNotFound) {
-			return err
+			errs = append(errs, err)
 		}
-		return nil
+		return stderrors.Join(errs...)
 	})
 	if err != nil {
 		invalid = invalid.WithHint("The device code has already been used. Additionally, an error occurred during the revocation of its tokens.").WithDebug(err.Error())
