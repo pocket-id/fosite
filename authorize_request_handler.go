@@ -490,6 +490,11 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 		if isPAR, err := f.authorizeRequestFromPAR(ctx, r, request); err != nil {
 			return request, err
 		} else if isPAR {
+			// The client may have dropped the redirect URI since the request was pushed
+			if !request.IsRedirectURIValid() {
+				return request, errorsx.WithStack(ErrInvalidRequest.WithHint("The 'redirect_uri' of the pushed authorization request is no longer registered for the OAuth 2.0 Client."))
+			}
+
 			// No need to continue
 			return request, nil
 		} else if configProvider, ok := f.Config.(PushedAuthorizeRequestConfigProvider); ok && configProvider.EnforcePushedAuthorize(ctx) {
