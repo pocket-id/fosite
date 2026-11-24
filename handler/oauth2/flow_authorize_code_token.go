@@ -6,6 +6,7 @@ package oauth2
 
 import (
 	"context"
+	stderrors "errors"
 	"time"
 
 	"github.com/ory/x/errorsx"
@@ -29,10 +30,10 @@ func (c *AuthorizeExplicitGrantHandler) HandleTokenEndpointRequest(ctx context.C
 	signature := c.Strategy.AuthorizeCodeStrategy().AuthorizeCodeSignature(ctx, code)
 	authorizeRequest, err := c.Storage.AuthorizeCodeStorage().GetAuthorizeCodeSession(ctx, code, signature, request.GetSession())
 	reused := errors.Is(err, fosite.ErrInvalidatedAuthorizeCode)
-	if reused && authorizeRequest == nil {
+	if reused && (authorizeRequest == nil || authorizeRequest.GetSession() == nil || authorizeRequest.GetClient() == nil) {
 		return fosite.ErrServerError.
 			WithHint("Misconfigured code lead to an error that prohibited the OAuth 2.0 Framework from processing this request.").
-			WithDebug("GetAuthorizeCodeSession must return a value for \"fosite.Requester\" when returning \"ErrInvalidatedAuthorizeCode\".")
+			WithDebug("GetAuthorizeCodeSession must return a complete \"fosite.Requester\" (client and session) when returning \"ErrInvalidatedAuthorizeCode\".")
 	} else if err != nil && errors.Is(err, fosite.ErrNotFound) {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.WithWrap(err).WithDebug(err.Error()))
 	} else if err != nil && !reused {
@@ -96,14 +97,17 @@ func (c *AuthorizeExplicitGrantHandler) HandleTokenEndpointRequest(ctx context.C
 // The refresh token goes first and both go in one transaction, so a refresh that runs at the same time can't leave a token behind
 func (c *AuthorizeExplicitGrantHandler) reusedCode(ctx context.Context, requestID string) error {
 	invalid := fosite.ErrInvalidGrant.WithHint("The authorization code has already been used.")
+	// Both revocations are attempted whatever the first one returns: a storage without real transactions cannot roll the
+	// first one back, so stopping at its error would leave the access token alive.
 	err := c.Storage.Transaction(ctx, func(ctx context.Context) error {
+		var errs []error
 		if err := c.Storage.TokenRevocationStorage().RevokeRefreshToken(ctx, requestID); err != nil && !errors.Is(err, fosite.ErrNotFound) {
-			return err
+			errs = append(errs, err)
 		}
 		if err := c.Storage.TokenRevocationStorage().RevokeAccessToken(ctx, requestID); err != nil && !errors.Is(err, fosite.ErrNotFound) {
-			return err
+			errs = append(errs, err)
 		}
-		return nil
+		return stderrors.Join(errs...)
 	})
 	if err != nil {
 		invalid = invalid.WithHint("The authorization code has already been used. Additionally, an error occurred during the revocation of its tokens.").WithDebug(err.Error())
