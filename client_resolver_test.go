@@ -402,7 +402,7 @@ func (f *blockingCIMDFetcher) Fetch(ctx context.Context, _ string) (*ClientMetad
 	return f.document, CIMDCachePolicy{TTL: time.Hour, Store: true}, nil
 }
 
-func TestCIMDResolver_CancelsWorkWithLeaderContext(t *testing.T) {
+func TestCIMDResolver_DiscoveryOutlivesItsFirstCaller(t *testing.T) {
 	const id = "https://app.example.com/oauth/client"
 	document := &ClientMetadataDocument{
 		ClientID:                id,
@@ -427,13 +427,13 @@ func TestCIMDResolver_CancelsWorkWithLeaderContext(t *testing.T) {
 	}()
 
 	<-fetcher.started
-	// The request that triggered discovery disconnects mid-fetch.
+	// The request that triggered discovery disconnects mid-fetch, while other requests for the client may be waiting for it
 	cancelLeader()
 	close(fetcher.release)
 
 	select {
 	case err := <-fetcher.ctxErr:
-		require.ErrorIs(t, err, context.Canceled)
+		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("fetch did not complete")
 	}

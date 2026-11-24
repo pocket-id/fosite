@@ -232,8 +232,10 @@ func (r *CIMDResolver) RefreshClient(ctx context.Context, clientID string) (Clie
 }
 
 func (r *CIMDResolver) discover(ctx context.Context, clientID string, next ClientLookupFunc, associated bool) (Client, error) {
+	// Every request for the client waits for this one discovery, so it must not end with the request that happened to start it
+	shared := context.WithoutCancel(ctx)
 	result := r.group.DoChan(clientID, func() (any, error) {
-		cached, found, err := r.load(ctx, clientID)
+		cached, found, err := r.load(shared, clientID)
 		if err != nil {
 			return nil, err
 		}
@@ -241,7 +243,7 @@ func (r *CIMDResolver) discover(ctx context.Context, clientID string, next Clien
 			return r.configureClient(cached.Client)
 		}
 		if !found && next != nil {
-			client, err := next(ctx, clientID)
+			client, err := next(shared, clientID)
 			if err == nil {
 				return client, nil
 			}
@@ -249,7 +251,7 @@ func (r *CIMDResolver) discover(ctx context.Context, clientID string, next Clien
 				return nil, err
 			}
 		}
-		return r.fetchAndMaterialize(ctx, clientID)
+		return r.fetchAndMaterialize(shared, clientID)
 	})
 
 	select {
@@ -322,9 +324,8 @@ func (r *CIMDResolver) fetchAndMaterialize(ctx context.Context, clientID string)
 	}
 	defer release()
 
-	// A failure is remembered unless the request that asked for the discovery went away, which says nothing about the document
 	defer func() {
-		if err != nil && ctx.Err() == nil {
+		if err != nil {
 			r.rememberFailure(clientID, err)
 		}
 	}()
