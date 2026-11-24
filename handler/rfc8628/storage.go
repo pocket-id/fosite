@@ -25,6 +25,10 @@ type DeviceAuthStorage interface {
 	// InvalidateDeviceCodeSession is called when a device code is being used. The state of the device
 	// code should be set to invalid and consecutive requests to GetDeviceCodeSession should return the
 	// ErrInvalidatedDeviceCode error.
+	//
+	// It must be a compare-and-set: when the device code is already invalidated it MUST return
+	// ErrInvalidatedDeviceCode, inside a real transaction, instead of succeeding a second time. Two polls that
+	// redeem the same device code at the same time would otherwise both get tokens.
 	InvalidateDeviceCodeSession(ctx context.Context, signature string) (err error)
 }
 

@@ -39,6 +39,17 @@ type AuthorizeCodeStorage interface {
 	// record redemption state derived from the code's contents (e.g., a replay-marker row
 	// whose fields come from the AEAD payload) use code; implementations that mutate a row
 	// by PK use signature.
+	//
+	// A code must be redeemable once. Two requests that redeem it at the same time both pass the checks that read the
+	// code, so the storage has to make the invalidation itself a compare-and-set: when the code is already invalidated
+	// it MUST return ErrInvalidatedAuthorizeCode (inside a transaction, so that the tokens created for the losing
+	// request are rolled back), and not succeed a second time. An invalidation that always succeeds, such as an
+	// unconditional "set revoked = true", lets both requests get tokens for one code.
+	//
+	// Transaction must be a real database transaction for the loser's tokens to be rolled back and, above all, for
+	// its invalidation to wait for the winner's commit: with a Transaction that only calls the function, the loser can
+	// revoke the grant before the winner has created its tokens, and they survive. RotateRefreshToken must likewise
+	// fail (ErrInactiveToken or ErrNotFound) for a refresh token that is no longer active.
 	InvalidateAuthorizeCodeSession(ctx context.Context, code, signature string) (err error)
 }
 type AuthorizeCodeStorageProvider interface {

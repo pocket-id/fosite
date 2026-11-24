@@ -9,6 +9,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/pocket-id/fosite"
 )
 
@@ -55,4 +57,15 @@ func TestMemoryStore_Authenticate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The documented contract of oauth2.AuthorizeCodeStorage: the invalidation is a compare-and-set, so only one of two
+// concurrent redemptions of a code can win.
+func TestMemoryStoreInvalidateAuthorizeCodeIsCompareAndSet(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+	require.NoError(t, s.CreateAuthorizeCodeSession(ctx, "sig", fosite.NewRequest()))
+	require.NoError(t, s.InvalidateAuthorizeCodeSession(ctx, "code", "sig"))
+	require.ErrorIs(t, s.InvalidateAuthorizeCodeSession(ctx, "code", "sig"), fosite.ErrInvalidatedAuthorizeCode)
+	require.ErrorIs(t, s.InvalidateAuthorizeCodeSession(ctx, "code", "unknown"), fosite.ErrNotFound)
 }
