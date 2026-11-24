@@ -239,16 +239,23 @@ func (c *Handler) verify(ctx context.Context, verifier string, pkceRequest fosit
 // authorization code handler invalidated the code, so a token request that
 // fails in between cannot be retried without the verifier. The PKCE handler
 // must therefore be composed after the authorization code handler.
-func (c *Handler) PopulateTokenEndpointResponse(ctx context.Context, requester fosite.AccessRequester, _ fosite.AccessResponder) error {
+func (c *Handler) PopulateTokenEndpointResponse(ctx context.Context, requester fosite.AccessRequester, responder fosite.AccessResponder) error {
 	if !c.CanHandleTokenEndpointRequest(ctx, requester) {
 		return errorsx.WithStack(fosite.ErrUnknownRequest)
 	}
 
+	// The authorization code handler issues the access token in the same step that invalidates the code. Without one the
+	// code is still redeemable, so consuming its PKCE session here would let the next request skip the verifier.
+	if responder.GetAccessToken() == "" {
+		return errorsx.WithStack(fosite.ErrServerError.WithDebug("The PKCE handler must be composed after the authorize code handler."))
+	}
+
 	code := requester.GetRequestForm().Get("code")
 	signature := c.Strategy.AuthorizeCodeStrategy().AuthorizeCodeSignature(ctx, code)
-	if err := c.Storage.PKCERequestStorage().DeletePKCERequestSession(ctx, code, signature); err != nil && !errors.Is(err, fosite.ErrNotFound) {
-		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
-	}
+	// By now the code is invalidated and the tokens are stored. If this fails, the response must not fail: the client
+	// would retry with a code that is already used, and that revokes the grant it just got. The session that is left
+	// behind is harmless: nothing reads it once the code is invalid, and a storage should expire it.
+	_ = c.Storage.PKCERequestStorage().DeletePKCERequestSession(ctx, code, signature)
 
 	return nil
 }
