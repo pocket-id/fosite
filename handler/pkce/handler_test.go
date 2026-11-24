@@ -470,7 +470,46 @@ func TestPKCEHandleTokenEndpointRequestConsumesSessionOnlyAfterVerification(t *t
 	require.NoError(t, err)
 
 	require.ErrorIs(t, h.PopulateTokenEndpointResponse(ctx, fosite.NewAccessRequest(&fosite.DefaultSession{}), fosite.NewAccessResponse()), fosite.ErrUnknownRequest)
-	require.NoError(t, h.PopulateTokenEndpointResponse(ctx, newRequest(verifier), fosite.NewAccessResponse()))
+	// Composed before the authorization code handler, nothing has issued a token yet: refuse, and keep the session.
+	require.ErrorIs(t, h.PopulateTokenEndpointResponse(ctx, newRequest(verifier), fosite.NewAccessResponse()), fosite.ErrServerError)
+	_, err = s.GetPKCERequestSession(ctx, "code", "signature", nil)
+	require.NoError(t, err)
+
+	issued := fosite.NewAccessResponse()
+	issued.SetAccessToken("token")
+	require.NoError(t, h.PopulateTokenEndpointResponse(ctx, newRequest(verifier), issued))
 	_, err = s.GetPKCERequestSession(ctx, "code", "signature", nil)
 	require.ErrorIs(t, err, fosite.ErrNotFound)
+}
+
+// failingDeleteStorage cannot delete PKCE sessions, as a database that is briefly unavailable.
+type failingDeleteStorage struct{ *storage.MemoryStore }
+
+func (s failingDeleteStorage) PKCERequestStorage() pkce.PKCERequestStorage {
+	return failingDeletePKCEStorage{s.MemoryStore}
+}
+
+type failingDeletePKCEStorage struct{ pkce.PKCERequestStorage }
+
+func (failingDeletePKCEStorage) DeletePKCERequestSession(context.Context, string, string) error {
+	return errors.New("storage unavailable")
+}
+
+// Once the code is invalidated the tokens exist, so a PKCE session that cannot be deleted does not fail the response.
+func TestPKCEPopulateTokenEndpointResponseSurvivesAFailingDelete(t *testing.T) {
+	ctx := context.Background()
+	h := &pkce.Handler{
+		Storage:  failingDeleteStorage{storage.NewMemoryStore()},
+		Strategy: &mockStrategyProvider{strategy: &mockCodeStrategy{signature: "signature"}},
+		Config:   &fosite.Config{},
+	}
+
+	r := fosite.NewAccessRequest(&fosite.DefaultSession{})
+	r.GrantTypes = fosite.Arguments{"authorization_code"}
+	r.Client = &fosite.DefaultClient{}
+	r.Form.Set("code", "code")
+	issued := fosite.NewAccessResponse()
+	issued.SetAccessToken("token")
+
+	require.NoError(t, h.PopulateTokenEndpointResponse(ctx, r, issued))
 }
