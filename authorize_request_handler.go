@@ -488,11 +488,42 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 	// Check if this is a continuation from a pushed authorization request
 	if !isPARRequest {
 		if isPAR, err := f.authorizeRequestFromPAR(ctx, r, request); err != nil {
+			// The request may already carry the redirect URI of the pushed request, validated against the client
+			// as it was when it was pushed, not as it is now: never redirect an error to it.
+			request.RedirectURI = nil
 			return request, err
 		} else if isPAR {
+			// The pushed request carries the client as it was when the request was pushed. The client may have
+			// dropped the redirect URI, a scope or a response type since then, or may be gone: check the request
+			// against the client as it is now, and continue with that one.
+			pushedClientID := request.GetClient().GetID()
+			client, err := f.resolveClient(ctx, pushedClientID)
+			if err != nil {
+				// RFC 6749 4.1.2.1: with an invalid client the user agent MUST NOT be redirected. The redirect URI
+				// belongs to the client as it was pushed, so it is dropped and the error is written as JSON.
+				request.RedirectURI = nil
+				if errors.Is(err, ErrCIMDTemporarilyUnavailable) {
+					return request, errorsx.WithStack(clientLookupError(err))
+				}
+				return request, errorsx.WithStack(ErrInvalidClient.WithHint("The OAuth 2.0 Client of the pushed authorization request does not exist.").WithWrap(err).WithDebug(err.Error()))
+			}
+			if client == nil || client.GetID() != pushedClientID {
+				request.RedirectURI = nil
+				return request, errorsx.WithStack(ErrInvalidClient.WithHint("The OAuth 2.0 Client of the pushed authorization request does not exist."))
+			}
+			request.Client = client
+
 			// The client may have dropped the redirect URI since the request was pushed
 			if !request.IsRedirectURIValid() {
 				return request, errorsx.WithStack(ErrInvalidRequest.WithHint("The 'redirect_uri' of the pushed authorization request is no longer registered for the OAuth 2.0 Client."))
+			}
+
+			if err := f.validateAuthorizeScope(ctx, r, request); err != nil {
+				return request, err
+			}
+
+			if err := f.validateResponseTypes(r, request); err != nil {
+				return request, err
 			}
 
 			// No need to continue
